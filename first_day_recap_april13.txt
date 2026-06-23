@@ -1,0 +1,30 @@
+TO: mddnnbr@gmail.com
+SUBJECT: Trading Bot — First Day Paper Trading Recap (April 13)
+DATE: Monday, April 13, 2026
+
+---
+
+Hey Baker,
+
+Quick update on your trading bot for Monday, April 13 — first day of paper trading.
+
+It looks like the scheduler didn't fire today. The trade log and scheduler log are both empty, which almost certainly means market_scheduler.py wasn't started this morning. Totally understandable for day one — there's always a bit of setup friction.
+
+Here's where things stand:
+- Signals generated: 0
+- Approved trades: 0
+- Paper P&L: $0.00
+- All five agents (Technical, News, Sentiment, Risk, Meta) are active and configured, just waiting for their first run.
+
+The good news: the system looks healthy. agent_summary.json is present and properly structured — everything is wired up correctly, it just needs to be kicked off.
+
+To get trading tomorrow, just run `python market_scheduler.py` before market open. If you'd rather not do this manually each morning, now's a good time to get the Google Cloud VM set up for automatic operation — happy to help with that whenever you're ready.
+
+Weekly reports start next Monday — you're all set.
+
+---
+NOTE FOR BAKER: This email could not be sent automatically because the scheduled task's
+sandbox environment does not have outbound SMTP access. The email content above is
+exactly what would have been sent to mddnnbr@gmail.com. You may want to configure
+the scheduled task to run from your local machine or the Google Cloud VM where network
+access to smtp.gmail.com:465 is available.

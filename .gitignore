@@ -1,0 +1,31 @@
+# ── Secrets — NEVER commit these ─────────────
+.env
+.env.*
+*.env
+.etrade_tokens.json
+secrets.json
+credentials.json
+
+# ── Logs & data (large/sensitive) ────────────
+logs/
+*.jsonl
+*.log
+
+# ── Python ────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# ── VS Code ───────────────────────────────────
+.vscode/
+
+# ── OS files ──────────────────────────────────
+.DS_Store
+Thumbs.db
