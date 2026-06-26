@@ -60,7 +60,7 @@ DEFAULT_SYMBOLS = [
     # High-momentum / high-volume
     "PLTR", "COIN", "SOFI", "SMCI", "AVGO", "CRWD", "PANW", "SNOW",
     # Broad market movers
-    "NFLX", "UBER", "ABNB", "SHOP", "SQ", "RBLX",
+    "NFLX", "UBER", "ABNB", "SHOP", "XOM", "RBLX",
     # Macro hedges
     "GLD", "TLT", "UUP", "VIX",
 ]
