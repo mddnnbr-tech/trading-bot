@@ -165,6 +165,7 @@ def _stream_loop(symbols: list[str]):
 
     try:
         from alpaca.data.live import StockDataStream  # type: ignore
+        from alpaca.data.enums import DataFeed         # type: ignore
     except ImportError:
         log.error(
             "alpaca-py not installed. Run: pip install alpaca-py\n"
@@ -178,7 +179,7 @@ def _stream_loop(symbols: list[str]):
     while _stream_active:
         try:
             log.info(f"AlpacaStream: connecting (paper={ALPACA_PAPER})...")
-            feed = "iex" if ALPACA_PAPER else "sip"
+            feed = DataFeed.IEX if ALPACA_PAPER else DataFeed.SIP
 
             stream = StockDataStream(
                 api_key=ALPACA_API_KEY,
