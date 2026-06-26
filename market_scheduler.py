@@ -44,6 +44,10 @@ MARKET_CLOSE    = (16, 0)    # hour, minute ET
 TICK_SECONDS    = 60         # how often the main loop fires
 EVAL_TIMES_ET   = [(10, 0), (15, 30)]   # twice-daily evaluation windows
 LEARN_TIME_ET   = (15, 45)              # weekly learning run: Fridays at 3:45 PM ET
+SUMMARY_TIME_ET = (15, 55)             # daily Slack summary: 3:55 PM ET
+
+SLACK_WEBHOOK   = os.getenv("SLACK_WEBHOOK_URL", "")
+SLACK_CHANNEL   = "#trading-alerts"
 
 # ── Logging setup ────────────────────────────────────────────────────────────
 LOG_FILE = os.path.join(os.path.dirname(__file__), "logs", "scheduler.log")
@@ -125,6 +129,57 @@ def run_agent_tick():
         log.error(f"Ensemble tick failed: {e}", exc_info=True)
 
 
+def post_daily_slack_summary():
+    """Post end-of-day summary to Slack #trading-alerts at 3:55 PM ET."""
+    if not SLACK_WEBHOOK:
+        log.debug("SLACK_WEBHOOK_URL not set — skipping daily summary")
+        return
+    try:
+        import json, urllib.request, urllib.error
+        log_path = os.path.join(os.path.dirname(__file__), "logs", "scheduler.log")
+        approved_today = rejected_today = errors_today = 0
+        try:
+            with open(log_path) as f:
+                today_str = datetime.now(ET).strftime("%Y-%m-%d")
+                for line in f:
+                    if today_str not in line:
+                        continue
+                    if "APPROVED" in line:
+                        approved_today += 1
+                    elif "REJECTED" in line:
+                        rejected_today += 1
+                    elif "[ERROR]" in line:
+                        errors_today += 1
+        except Exception:
+            pass
+
+        from alpaca_stream import is_streaming
+        stream_status = "Live Alpaca stream" if is_streaming() else "yfinance fallback"
+        status_icon = "✅" if errors_today == 0 else "⚠️"
+
+        text = (
+            f"{status_icon} *BluSterling Daily Summary — {datetime.now(ET).strftime('%a %b %d')}*\n"
+            f"• Signals approved: *{approved_today}*\n"
+            f"• Signals rejected: {rejected_today}\n"
+            f"• Errors: {errors_today}\n"
+            f"• Data source: {stream_status}\n"
+            f"_Next run: Mon–Fri 9:30 AM ET_"
+        )
+        if errors_today > 0:
+            text += f"\n⚠️ *{errors_today} error(s) today — check logs*"
+
+        payload = json.dumps({"text": text}).encode()
+        req = urllib.request.Request(
+            SLACK_WEBHOOK,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+        log.info("Daily Slack summary posted.")
+    except Exception as e:
+        log.warning(f"Slack summary failed: {e}")
+
+
 def run_learning_cycle():
     """Run the strategy learner — Fridays at 3:45 PM ET."""
     log.info("=" * 60)
@@ -204,6 +259,14 @@ def main():
                     and learn_key not in _eval_done_this_window):
                 _eval_done_this_window.add(learn_key)
                 run_learning_cycle()
+
+            # ── Daily Slack summary at 3:55 PM ET ────────────────────────
+            summary_key = f"summary_{now.date()}"
+            if (now.hour == SUMMARY_TIME_ET[0]
+                    and now.minute == SUMMARY_TIME_ET[1]
+                    and summary_key not in _eval_done_this_window):
+                _eval_done_this_window.add(summary_key)
+                post_daily_slack_summary()
 
         else:
             # Outside market hours — sleep longer to conserve resources
