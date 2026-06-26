@@ -48,13 +48,14 @@ from typing import Optional, Set
 log = logging.getLogger("MetaAgent")
 
 # ── Synthesis config ────────────────────────────────────────────────────────
-CONSENSUS_THRESHOLD    = 0.50   # minimum confidence to pass through
+CONSENSUS_THRESHOLD    = 0.45   # lowered from 0.50 — pass more signals during bootstrap
 CONFLICT_CANCEL        = False  # keep dominant direction instead of cancelling
-AGREEMENT_BONUS        = 0.08   # confidence boost per extra agreeing agent
-MAX_SIGNALS_PER_TICK   = 6      # up from 5 — more agents, more opportunities
-MIN_AGENT_WEIGHT       = 0.15   # floor weight even for underperformers
+AGREEMENT_BONUS        = 0.10   # raised: extra boost when multiple agents agree
+MAX_SIGNALS_PER_TICK   = 8      # more concurrent positions = more chances to win
+MIN_AGENT_WEIGHT       = 0.65   # raised from 0.15 — no agent is penalized until 20+ closed trades
 PROFIT_WEIGHT_EXPONENT = 0.6    # power curve — top earners rewarded more
 REGIME_BOOST           = 0.25   # weight bonus for agents in their best regime
+MIN_TRADES_FOR_WEIGHTING = 20   # don't apply P&L weighting until we have real data
 
 # Full 12-agent roster with default weights
 DEFAULT_WEIGHTS = {
@@ -274,6 +275,13 @@ class MetaAgent:
             cutoff_iso = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
 
             all_trades = _ledger.all_trades()
+            closed = [t for t in all_trades if not t.is_open]
+            if len(closed) < MIN_TRADES_FOR_WEIGHTING:
+                log.info(
+                    f"MetaAgent: only {len(closed)} closed trades "
+                    f"(need {MIN_TRADES_FOR_WEIGHTING}) — using DEFAULT_WEIGHTS"
+                )
+                return dict(DEFAULT_WEIGHTS)
             if not all_trades:
                 log.info("MetaAgent: ledger is empty — using DEFAULT_WEIGHTS")
                 return dict(DEFAULT_WEIGHTS)

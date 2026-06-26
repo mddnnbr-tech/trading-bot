@@ -36,10 +36,10 @@ load_dotenv()
 log = logging.getLogger("AgentRiskBridge")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MAX_POSITION_SIZE_PCT = float(os.getenv("MAX_POSITION_SIZE_PCT", "1.5"))
+MAX_POSITION_SIZE_PCT = float(os.getenv("MAX_POSITION_SIZE_PCT", "2.0"))
 PAPER_TRADING         = os.getenv("PAPER_TRADING", "true").lower() == "true"
 PDT_THRESHOLD         = 25_000.0    # SEC rule: accounts < $25k have PDT limits
-MIN_CONFIDENCE        = 0.55        # signals below this are always rejected
+MIN_CONFIDENCE        = 0.50        # lowered from 0.55 — match MetaAgent threshold
 MAX_OPTION_PREMIUM    = 5.00        # default max option premium (per contract) if not provided
 
 # Required fields every signal must carry
@@ -63,7 +63,7 @@ class AgentRiskBridge:
 
     def __init__(self, account_balance: float | None = None):
         self.account_balance = account_balance or float(
-            os.getenv("ACCOUNT_BALANCE", "16000")
+            os.getenv("ACCOUNT_BALANCE", "100000")
         )
         self._pdt_trades_today: int = 0   # incremented by caller if needed
 
