@@ -123,6 +123,9 @@ class MetaAgent:
             merged = self._cancel_conflicts(merged)
 
         # Step 4: Filter by consensus threshold
+        if merged:
+            top = sorted(merged, key=lambda x: x["confidence"], reverse=True)[:5]
+            log.info(f"MetaAgent top merged confs: {[(s['symbol'],s['direction'],round(s['confidence'],3)) for s in top]}")
         passed = [s for s in merged if s["confidence"] >= CONSENSUS_THRESHOLD]
 
         # Step 5: Sort by confidence, take top N
