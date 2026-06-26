@@ -32,7 +32,7 @@ WATCHLIST = [
     "TSLA", "RIVN", "LCID", "WOLF", "ARKK",
     "MARA", "RIOT", "COIN", "HOOD", "SOFI",
     "QQQ", "SPY", "IWM", "XLF", "XLE",
-    "NFLX", "DIS", "BA", "PARA", "CVS",
+    "NFLX", "DIS", "BA", "SPOT", "CVS",
 ]
 
 MAX_ROC_5D       = -1.5   # must be down at least 1.5% in 5 days

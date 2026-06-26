@@ -293,9 +293,16 @@ class MetaAgent:
             weights: dict[str, float] = {}
 
             if max_pnl <= 0:
-                # Whole signal-agent slate underwater in the window — collapse
-                # everyone to the floor. MetaAgent stops amplifying any agent
-                # until somebody clears zero. Rotator will bench bottoms.
+                # Check if this is "no closed trades yet" vs "genuinely underwater"
+                closed_with_pnl = [
+                    t for t in all_trades
+                    if t.status in ("target", "stop", "expired")
+                    and (t.realized_pnl or 0.0) != 0.0
+                ]
+                if not closed_with_pnl:
+                    log.info("MetaAgent: no closed trades with P&L yet — using DEFAULT_WEIGHTS")
+                    return dict(DEFAULT_WEIGHTS)
+                # Genuinely underwater — collapse everyone to floor
                 log.warning(
                     "MetaAgent: no positive P&L in last 20d across signal agents "
                     f"— using MIN_AGENT_WEIGHT ({MIN_AGENT_WEIGHT}) for all"
