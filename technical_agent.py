@@ -43,6 +43,8 @@ WATCHLIST = [
     "NFLX", "UBER", "ABNB", "SHOP", "XOM", "RBLX",
     # Leveraged ETFs — 3x bull/bear for all-weather trading
     "TQQQ", "SQQQ", "UPRO", "SPXU", "TNA", "TZA", "LABU", "LABD",
+    # Crypto — 24/7 market, high volatility, real opportunities
+    "BTC/USD", "ETH/USD", "SOL/USD",
 ]
 
 # ── Indicator parameters ──────────────────────────────────────────────────

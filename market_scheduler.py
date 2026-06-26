@@ -180,6 +180,101 @@ def post_daily_slack_summary():
         log.warning(f"Slack summary failed: {e}")
 
 
+def send_daily_email():
+    """Send end-of-day recap email via Gmail SMTP."""
+    try:
+        import smtplib, json
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        gmail   = os.getenv("GMAIL_ADDRESS", "")
+        pw      = os.getenv("GMAIL_APP_PASSWORD", "")
+        to      = os.getenv("REPORT_TO_EMAIL", gmail)
+        if not gmail or not pw:
+            log.debug("Gmail creds not set — skipping email")
+            return
+        import trade_ledger as _ledger
+        trades   = _ledger.all_trades()
+        today    = datetime.now(ET).strftime("%Y-%m-%d")
+        today_t  = [t for t in trades if t.opened_at_et.startswith(today)]
+        open_t   = [t for t in today_t if t.is_open]
+        closed_t = [t for t in today_t if not t.is_open]
+        realized = sum(t.realized_pnl or 0 for t in closed_t)
+        unreal   = sum(t.unrealized_pnl or 0 for t in open_t)
+        rows = "".join(
+            f"<tr><td>{t.symbol}</td><td>{t.side}</td>"
+            f"<td>${t.entry_price:.2f}</td><td>{t.status}</td>"
+            f"<td style='color:{'green' if (t.realized_pnl or t.unrealized_pnl or 0)>=0 else 'red'}'>"
+            f"${(t.realized_pnl or t.unrealized_pnl or 0):+.2f}</td></tr>"
+            for t in today_t
+        )
+        html = f"""<html><body>
+        <h2>BluSterling Trading Bot — {datetime.now(ET).strftime('%b %d, %Y')}</h2>
+        <p><b>Realized P&L:</b> <span style="color:{'green' if realized>=0 else 'red'}">${realized:+.2f}</span> &nbsp;
+           <b>Unrealized:</b> ${unreal:+.2f} &nbsp;
+           <b>Trades today:</b> {len(today_t)}</p>
+        <table border="1" cellpadding="4" style="border-collapse:collapse">
+        <tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Status</th><th>P&L</th></tr>
+        {rows if rows else '<tr><td colspan=5>No trades today</td></tr>'}
+        </table>
+        <p style="color:gray;font-size:12px">BluSterling & Associates LLC — paper trading</p>
+        </body></html>"""
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"Trading Bot — {datetime.now(ET).strftime('%b %d')} | P&L ${realized:+.2f}"
+        msg["From"]    = gmail
+        msg["To"]      = to
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(gmail, pw)
+            s.sendmail(gmail, to, msg.as_string())
+        log.info(f"Daily recap email sent to {to}")
+    except Exception as e:
+        log.warning(f"Email send failed: {e}")
+
+
+def sync_alpaca_positions():
+    """
+    Pull closed orders from Alpaca and update trade_ledger with realized P&L.
+    Runs at market close so the strategy learner has real data each Friday.
+    """
+    try:
+        from alpaca.trading.client import TradingClient
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+        import trade_ledger as _ledger
+
+        key    = os.getenv("ALPACA_API_KEY", "")
+        secret = os.getenv("ALPACA_API_SECRET", "")
+        if not key or not secret:
+            return
+        client = TradingClient(api_key=key, secret_key=secret, paper=True)
+        req    = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=50)
+        orders = client.get_orders(req)
+        trades = _ledger.load_ledger()
+        updated = 0
+        for order in orders:
+            sym  = str(order.symbol)
+            side = "LONG" if str(order.side) == "buy" else "SHORT"
+            for tid, t in trades.items():
+                if t.symbol == sym and t.side == side and t.is_open:
+                    filled = float(order.filled_avg_price or 0)
+                    if filled > 0:
+                        pnl = (filled - t.entry_price) * t.shares
+                        if side == "SHORT":
+                            pnl = -pnl
+                        t.status          = "target" if pnl >= 0 else "stop"
+                        t.exit_price      = filled
+                        t.exit_at_et      = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
+                        t.realized_pnl    = round(pnl, 2)
+                        t.unrealized_pnl  = 0.0
+                        updated += 1
+                        break
+        if updated:
+            _ledger.save_ledger(trades)
+            log.info(f"Alpaca sync: updated {updated} closed position(s) in ledger")
+    except Exception as e:
+        log.warning(f"Alpaca position sync failed: {e}")
+
+
 def run_learning_cycle():
     """Run the strategy learner — Fridays at 3:45 PM ET."""
     log.info("=" * 60)
@@ -267,6 +362,8 @@ def main():
                     and summary_key not in _eval_done_this_window):
                 _eval_done_this_window.add(summary_key)
                 post_daily_slack_summary()
+                send_daily_email()
+                sync_alpaca_positions()
 
         else:
             # Outside market hours — sleep longer to conserve resources
