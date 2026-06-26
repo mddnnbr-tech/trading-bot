@@ -444,6 +444,45 @@ def closed_trades() -> list[Trade]:
     return [t for t in all_trades() if not t.is_open]
 
 
+def record_trade(
+    symbol: str, side: str, entry_price: float,
+    target_price: float, stop_price: float, risk_dollar: float,
+    shares: float, primary_agent: str, contributors: str = "",
+    order_id: str = "",
+) -> str:
+    """
+    Write a new open trade directly to the ledger CSV.
+    Called by order_executor after a successful Alpaca order submission.
+    Returns the trade_id.
+    """
+    now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
+    raw = f"{now_et}{symbol}{side.upper()}{entry_price}"
+    trade_id = hashlib.sha1(raw.encode()).hexdigest()[:12]
+
+    trades = load_ledger()
+    if trade_id in trades:
+        return trade_id  # idempotent — already recorded
+
+    side_norm = "LONG" if side.upper() in LONG_SIDES else "SHORT"
+    t = Trade(
+        trade_id        = trade_id,
+        opened_at_et    = now_et,
+        symbol          = symbol,
+        side            = side_norm,
+        primary_agent   = primary_agent,
+        contributors    = contributors,
+        entry_price     = entry_price,
+        target_price    = target_price,
+        stop_price      = stop_price,
+        risk_dollar     = risk_dollar,
+        shares          = shares,
+        status          = "open",
+    )
+    trades[trade_id] = t
+    save_ledger(trades)
+    return trade_id
+
+
 def daily_pnl_series() -> list[dict]:
     """Group ALL trades by opened-date. Return [{date, realized, unrealized, count}]."""
     by_date: dict[str, dict] = defaultdict(lambda: {

@@ -61,8 +61,12 @@ DEFAULT_SYMBOLS = [
     "PLTR", "COIN", "SOFI", "SMCI", "AVGO", "CRWD", "PANW", "SNOW",
     # Broad market movers
     "NFLX", "UBER", "ABNB", "SHOP", "XOM", "RBLX",
+    # Leveraged ETFs — 3x bull/bear, all-weather
+    "TQQQ", "SQQQ", "UPRO", "SPXU", "TNA", "TZA", "LABU", "LABD",
     # Macro hedges
-    "GLD", "TLT", "UUP", "VIX",
+    "GLD", "TLT", "UUP",
+    # Crypto (Alpaca format)
+    "BTC/USD", "ETH/USD", "SOL/USD",
 ]
 
 MAX_BARS_PER_SYMBOL = 100  # keep last N 1-minute bars in memory

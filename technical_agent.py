@@ -41,6 +41,8 @@ WATCHLIST = [
     "PLTR", "COIN", "SOFI", "SMCI", "AVGO", "CRWD", "PANW", "SNOW",
     # Broad market movers
     "NFLX", "UBER", "ABNB", "SHOP", "XOM", "RBLX",
+    # Leveraged ETFs — 3x bull/bear for all-weather trading
+    "TQQQ", "SQQQ", "UPRO", "SPXU", "TNA", "TZA", "LABU", "LABD",
 ]
 
 # ── Indicator parameters ──────────────────────────────────────────────────

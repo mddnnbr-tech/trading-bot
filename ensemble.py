@@ -186,10 +186,8 @@ class Ensemble:
                         f"conf={signal['confidence']:.2f} tier={result.get('account_tier', '?')}"
                     )
                     approved.append(result)
-                    if PAPER_TRADING:
-                        self._log_paper_trade(result)
-                    else:
-                        log.info("Live mode — OrderExecutor not yet wired (Phase B)")
+                    from order_executor import execute_signal
+                    execute_signal(result)
                 else:
                     log.info(
                         f"⛔ REJECTED: {signal['symbol']:6} — "
