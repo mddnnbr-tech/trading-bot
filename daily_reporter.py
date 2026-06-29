@@ -874,7 +874,7 @@ class DailyReporter:
         all_time_pnl    = sum(t.get("gross_pnl", 0) for t in all_trades)
         all_time_trades = len(all_trades)
 
-        account_balance  = float(os.getenv("ACCOUNT_BALANCE", "16000"))
+        account_balance  = float(os.getenv("ACCOUNT_BALANCE", "100000"))
         daily_return_pct = (total_pnl / account_balance * 100) if account_balance else 0
 
         report = {

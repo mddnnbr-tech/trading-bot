@@ -136,37 +136,73 @@ def post_daily_slack_summary():
         return
     try:
         import json, urllib.request, urllib.error
+
+        today_str = datetime.now(ET).strftime("%Y-%m-%d")
+
+        # ── Pull real trade data from ledger ──────────────────────────────
+        realized = unrealized = 0.0
+        total_trades = wins = losses = open_count = 0
+        best_trade = worst_trade = None
+        try:
+            import trade_ledger as _ledger
+            all_t = _ledger.all_trades()
+            today_t = [t for t in all_t if t.opened_at_et.startswith(today_str)]
+            closed_t = [t for t in today_t if not t.is_open]
+            open_t   = [t for t in today_t if t.is_open]
+            realized   = sum(t.realized_pnl or 0 for t in closed_t)
+            unrealized = sum(t.unrealized_pnl or 0 for t in open_t)
+            total_trades = len(today_t)
+            wins   = sum(1 for t in closed_t if (t.realized_pnl or 0) > 0)
+            losses = sum(1 for t in closed_t if (t.realized_pnl or 0) <= 0)
+            open_count = len(open_t)
+
+            if closed_t:
+                best_trade  = max(closed_t, key=lambda t: t.realized_pnl or 0)
+                worst_trade = min(closed_t, key=lambda t: t.realized_pnl or 0)
+        except Exception:
+            pass
+
+        # ── Error count from log ──────────────────────────────────────────
+        errors_today = 0
         log_path = os.path.join(os.path.dirname(__file__), "logs", "scheduler.log")
-        approved_today = rejected_today = errors_today = 0
         try:
             with open(log_path) as f:
-                today_str = datetime.now(ET).strftime("%Y-%m-%d")
                 for line in f:
-                    if today_str not in line:
-                        continue
-                    if "APPROVED" in line:
-                        approved_today += 1
-                    elif "REJECTED" in line:
-                        rejected_today += 1
-                    elif "[ERROR]" in line:
+                    if today_str in line and "[ERROR]" in line:
                         errors_today += 1
         except Exception:
             pass
 
-        from alpaca_stream import is_streaming
-        stream_status = "Live Alpaca stream" if is_streaming() else "yfinance fallback"
-        status_icon = "✅" if errors_today == 0 else "⚠️"
+        try:
+            from alpaca_stream import is_streaming
+            stream_status = "Alpaca stream ✅" if is_streaming() else "yfinance fallback"
+        except Exception:
+            stream_status = "unknown"
 
-        text = (
-            f"{status_icon} *BluSterling Daily Summary — {datetime.now(ET).strftime('%a %b %d')}*\n"
-            f"• Signals approved: *{approved_today}*\n"
-            f"• Signals rejected: {rejected_today}\n"
-            f"• Errors: {errors_today}\n"
-            f"• Data source: {stream_status}\n"
-            f"_Next run: Mon–Fri 9:30 AM ET_"
-        )
-        if errors_today > 0:
-            text += f"\n⚠️ *{errors_today} error(s) today — check logs*"
+        pnl_total = realized + unrealized
+        pnl_sign  = "+" if pnl_total >= 0 else ""
+        pnl_emoji = "📈" if pnl_total >= 0 else "📉"
+        status_icon = "✅" if errors_today < 10 else "⚠️"
+
+        lines = [
+            f"{status_icon} *BluSterling Daily Summary — {datetime.now(ET).strftime('%a %b %d, %Y')}*",
+            f"",
+            f"{pnl_emoji} *Total P&L: {pnl_sign}${pnl_total:,.2f}*  _(realized: {'+' if realized>=0 else ''}${realized:,.2f} | open: {'+' if unrealized>=0 else ''}${unrealized:,.2f})_",
+            f"• Trades today: *{total_trades}*  ({wins}W / {losses}L closed, {open_count} still open)",
+        ]
+
+        if best_trade and (best_trade.realized_pnl or 0) > 0:
+            lines.append(f"🏆 Best: *{best_trade.symbol}* {best_trade.side}  +${best_trade.realized_pnl:,.2f}")
+        if worst_trade and (worst_trade.realized_pnl or 0) < 0:
+            lines.append(f"📉 Worst: *{worst_trade.symbol}* {worst_trade.side}  ${worst_trade.realized_pnl:,.2f}")
+
+        lines += [
+            f"",
+            f"• Data: {stream_status}  |  Errors: {errors_today}",
+            f"_Next run: Mon–Fri 9:30 AM ET_",
+        ]
+
+        text = "\n".join(lines)
 
         payload = json.dumps({"text": text}).encode()
         req = urllib.request.Request(

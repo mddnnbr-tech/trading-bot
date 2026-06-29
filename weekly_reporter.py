@@ -60,13 +60,33 @@ class WeeklyReporter:
         week_end = week_end or self._last_friday_close(now)
         week_start = week_end - timedelta(days=5)
 
-        # Pull week's trades
-        trades_7d = self.logger.get_trades(last_n_days=7)
+        # Pull week's trades from trade_ledger (paper_trades.csv) — the live source
+        try:
+            import trade_ledger as _ledger
+            all_ledger = _ledger.all_trades()
+            cutoff_str = week_start.strftime("%Y-%m-%d")
+            end_str    = (week_end + timedelta(days=1)).strftime("%Y-%m-%d")
+            ledger_week = [
+                t for t in all_ledger
+                if cutoff_str <= t.opened_at_et[:10] <= end_str
+            ]
+            # Convert Trade objects to the dict format this report expects
+            def _t(trade):
+                pnl = (trade.realized_pnl if not trade.is_open else trade.unrealized_pnl) or 0.0
+                return {
+                    "agent":     trade.primary_agent,
+                    "symbol":    trade.symbol,
+                    "gross_pnl": round(pnl, 2),
+                }
+            trades_7d = [_t(t) for t in ledger_week]
+        except Exception:
+            trades_7d = []
 
-        # Per-agent breakdown
+        # Per-agent breakdown — use all agents that appeared in ledger this week
         from performance_logger import ENSEMBLE_AGENTS
+        seen_agents = {t["agent"] for t in trades_7d} | set(ENSEMBLE_AGENTS)
         agent_breakdown = {}
-        for agent in ENSEMBLE_AGENTS:
+        for agent in seen_agents:
             agent_trades = [t for t in trades_7d if t["agent"] == agent]
             pnl   = sum(t["gross_pnl"] for t in agent_trades)
             wins  = sum(1 for t in agent_trades if t["gross_pnl"] >= 0)
@@ -104,7 +124,7 @@ class WeeklyReporter:
         all_time_trades = len(all_trades)
 
         # Portfolio return % this week
-        account_balance = float(os.getenv("ACCOUNT_BALANCE", "16000"))
+        account_balance = float(os.getenv("ACCOUNT_BALANCE", "100000"))
         weekly_return_pct = (total_pnl / account_balance * 100) if account_balance else 0
 
         return {
@@ -401,8 +421,8 @@ class WeeklyReporter:
     </ul>
   </div>
   <div class="footer">
-    Automated Trading Bot  •  E*TRADE/Morgan Stanley  •  This report is auto-generated.<br>
-    Check your E*TRADE account for confirmed position details.
+    BluSterling Trading Bot  •  Alpaca Paper Trading  •  This report is auto-generated.<br>
+    Check paper_trades.csv or Alpaca dashboard for confirmed position details.
   </div>
 </div>
 </body>
