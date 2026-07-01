@@ -392,13 +392,17 @@ def main():
                 run_learning_cycle()
 
             # ── Daily Slack summary at 3:55 PM ET ────────────────────────
+            # Email is deliberately NOT sent here — daily_reporter.py's cron
+            # job at 4:35 PM sends the one comprehensive daily email. Sending
+            # both meant two emails a day covering overlapping info, which
+            # was the actual cause of notification overload (not a missing
+            # setting). One Slack ping + one email per day, that's it.
             summary_key = f"summary_{now.date()}"
             if (now.hour == SUMMARY_TIME_ET[0]
                     and now.minute == SUMMARY_TIME_ET[1]
                     and summary_key not in _eval_done_this_window):
                 _eval_done_this_window.add(summary_key)
                 post_daily_slack_summary()
-                send_daily_email()
                 sync_alpaca_positions()
 
         else:
