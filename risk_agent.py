@@ -68,6 +68,12 @@ class RiskAgent:
           "confidence_multiplier": float,  # 1.0 = normal, 0.5 = halved
         }
         """
+        # Refresh P&L on every assessment. The ensemble reuses one RiskAgent
+        # instance across all ~390 daily ticks, so loading P&L only in
+        # __init__ froze the circuit breaker at the 9:30 AM snapshot — a
+        # mid-day drawdown could never trip the daily/weekly loss halts.
+        self._load_performance_data()
+
         warnings  = []
         status    = STATUS_GREEN
         halt      = False

@@ -93,9 +93,60 @@ def run_crypto_tick() -> list[dict]:
     return approved
 
 
+def manage_crypto_exits() -> None:
+    """Close crypto positions at Alpaca when price crosses stop or target.
+
+    Alpaca crypto doesn't support bracket orders, so the entry market order
+    carries no exchange-side exit — without this, coins bought by the bot sit
+    in the account forever while the ledger merely simulates the close. Each
+    tick, compare live price against the ledger's stop/target and submit a
+    real market sell when either is crossed (spot-only account: exits are
+    always sells of a long).
+    """
+    import trade_ledger as _ledger
+    import yfinance as yf
+
+    YF_MAP = {"BTC/USD": "BTC-USD", "ETH/USD": "ETH-USD", "SOL/USD": "SOL-USD"}
+
+    open_crypto = [t for t in _ledger.open_positions() if t.symbol in YF_MAP]
+    if not open_crypto:
+        return
+
+    for t in open_crypto:
+        try:
+            hist = yf.Ticker(YF_MAP[t.symbol]).history(period="1d", interval="5m")
+            if hist is None or hist.empty:
+                continue
+            price = float(hist["Close"].iloc[-1])
+
+            hit_target = price >= t.target_price
+            hit_stop   = price <= t.stop_price
+            if not (hit_target or hit_stop):
+                continue
+
+            reason = "target" if hit_target else "stop"
+            log.info(f"🚪 EXIT {t.symbol}: price ${price:,.2f} crossed {reason} "
+                     f"(target ${t.target_price:,.2f} / stop ${t.stop_price:,.2f}) — selling")
+
+            from order_executor import get_executor
+            executor = get_executor()
+            if executor._client is None:
+                log.warning("No Alpaca client — exit logged only")
+                continue
+
+            # close_position liquidates the whole holding for the symbol —
+            # simpler and safer than hand-computing a sell quantity that
+            # could drift from the actual filled amount.
+            # Alpaca's position API uses the no-slash form (BTCUSD).
+            executor._client.close_position(t.symbol.replace("/", ""))
+        except Exception as e:
+            log.warning(f"Crypto exit check failed for {t.symbol}: {e}")
+
+
 if __name__ == "__main__":
     try:
         run_crypto_tick()
+        manage_crypto_exits()
     except Exception as e:
         log.error(f"Crypto tick failed: {e}", exc_info=True)
         sys.exit(1)
