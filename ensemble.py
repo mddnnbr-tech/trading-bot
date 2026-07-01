@@ -179,6 +179,18 @@ class Ensemble:
         approved = []
         for signal in synthesized:
             try:
+                # Dedup gate: don't re-enter a symbol/direction we already
+                # hold. Without this, one bad signal repeats every tick and
+                # turns a single -$35 stop into a dozen duplicate positions.
+                import trade_ledger as _ledger
+                side = "LONG" if signal["direction"] == "long" else "SHORT"
+                if _ledger.has_open_position(signal["symbol"], side):
+                    log.info(
+                        f"⏭  SKIPPED: {signal['symbol']:6} {signal['direction']:5} "
+                        f"— already have an open {side} position"
+                    )
+                    continue
+
                 result = self.bridge.evaluate_signal(signal)
                 if result["approved"]:
                     log.info(

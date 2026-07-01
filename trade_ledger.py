@@ -440,6 +440,13 @@ def open_positions() -> list[Trade]:
     return [t for t in all_trades() if t.is_open]
 
 
+def has_open_position(symbol: str, side: str) -> bool:
+    """True if there's already an open trade for this symbol+side.
+    Used to stop the ensemble from re-entering the same position every tick."""
+    side = side.upper()
+    return any(t.symbol == symbol and t.side == side for t in open_positions())
+
+
 def closed_trades() -> list[Trade]:
     return [t for t in all_trades() if not t.is_open]
 
