@@ -214,21 +214,38 @@ class AgentRiskBridge:
             }
 
         else:
-            # Equity fallback: share-based sizing
+            # Equity/crypto fallback: share-based sizing.
+            #
+            # Bug fixed here: the old code sized shares purely off risk
+            # (dollar_risk / stop_distance) then rejected if the resulting
+            # NOTIONAL exceeded a cap derived from the RISK amount — those
+            # are different quantities. For a tight stop (crypto commonly
+            # uses 3%), risk-based sizing legitimately produces notional
+            # exposure ~33x the risked dollars (1/stop_pct) — that's normal,
+            # not oversized. The old cap rejected every single crypto trade.
+            # Fix: size to the SMALLER of (risk-based shares) or (a direct
+            # notional cap of MAX_POSITION_SIZE_PCT of account), instead of
+            # comparing notional against a risk-derived number.
             stop_distance = abs(entry - stop) if stop and stop != entry else entry * 0.02
-            if stop_distance <= 0:
+            if stop_distance <= 0 or entry <= 0:
                 return None
-            shares = max(int(dollar_risk / stop_distance), 1)
-            total_cost = shares * entry
 
-            if total_cost > self.account_balance * (MAX_POSITION_SIZE_PCT / 100) * 2:
+            shares_by_risk    = dollar_risk / stop_distance
+            max_notional      = self.account_balance * (MAX_POSITION_SIZE_PCT / 100)
+            shares_by_notional = max_notional / entry
+
+            shares = int(min(shares_by_risk, shares_by_notional))
+            if shares < 1:
                 return None
+
+            total_cost   = shares * entry
+            actual_risk  = shares * stop_distance   # real $ at risk given the sizing that was actually used
 
             return {
                 "shares":       shares,
                 "total_cost":   round(total_cost, 2),
-                "risk_amount":  dollar_risk,
-                "risk_pct":     round((dollar_risk / self.account_balance) * 100, 2),
+                "risk_amount":  round(actual_risk, 2),
+                "risk_pct":     round((actual_risk / self.account_balance) * 100, 2),
                 "instrument":   "equity",
                 "account_tier": account_tier,
             }
