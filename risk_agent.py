@@ -34,7 +34,7 @@ VIX_HALT_THRESHOLD      = float(os.getenv("VIX_HALT_THRESHOLD",      "35"))
 DAILY_LOSS_LIMIT_PCT    = float(os.getenv("DAILY_LOSS_LIMIT_PCT",     "3.0"))
 WEEKLY_LOSS_LIMIT_PCT   = float(os.getenv("WEEKLY_LOSS_LIMIT_PCT",    "8.0"))
 MAX_CONSECUTIVE_LOSSES  = int(os.getenv("MAX_CONSECUTIVE_LOSSES",     "3"))
-ACCOUNT_BALANCE         = float(os.getenv("ACCOUNT_BALANCE",          "16000"))
+ACCOUNT_BALANCE         = float(os.getenv("ACCOUNT_BALANCE",          "100000"))
 
 # ── Risk status levels ──────────────────────────────────────────────────────
 STATUS_GREEN  = "GREEN"    # all clear
@@ -162,22 +162,38 @@ class RiskAgent:
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def _load_performance_data(self):
-        """Read today's and this week's P&L from the trade log."""
+        """Read today's and this week's P&L from the live ledger (paper_trades.csv).
+
+        v2 fix: this used to read from PerformanceLogger/trade_log.jsonl, a file
+        the bot never writes to — meaning daily/weekly loss halts and the
+        consecutive-loss throttle silently never fired. trade_ledger is the
+        single source of truth everywhere else in the system; use it here too.
+        """
         try:
-            from performance_logger import PerformanceLogger
-            logger = PerformanceLogger()
+            import trade_ledger as _ledger
+            from datetime import timedelta
 
-            trades_today  = logger.get_trades(last_n_days=1)
-            trades_week   = logger.get_trades(last_n_days=7)
+            all_trades = _ledger.all_trades()
+            today_str  = datetime.now(_ledger.ET).strftime("%Y-%m-%d")
+            week_cut   = (datetime.now(_ledger.ET) - timedelta(days=7)).strftime("%Y-%m-%d")
 
-            self.daily_pnl  = sum(t["gross_pnl"] for t in trades_today)
-            self.weekly_pnl = sum(t["gross_pnl"] for t in trades_week)
+            def pnl(t):
+                return t.realized_pnl if not t.is_open else t.unrealized_pnl
 
-            # Count consecutive losses from most recent trades backward
-            all_trades = logger.get_trades()
+            trades_today = [t for t in all_trades if t.opened_at_et[:10] == today_str]
+            trades_week  = [t for t in all_trades if t.opened_at_et[:10] >= week_cut]
+
+            self.daily_pnl  = sum(pnl(t) for t in trades_today)
+            self.weekly_pnl = sum(pnl(t) for t in trades_week)
+
+            # Count consecutive losses from most recent CLOSED trades backward
+            closed = sorted(
+                [t for t in all_trades if not t.is_open],
+                key=lambda t: t.exit_at_et or t.opened_at_et,
+            )
             self.consecutive_losses = 0
-            for trade in reversed(all_trades):
-                if trade["gross_pnl"] < 0:
+            for trade in reversed(closed):
+                if (trade.realized_pnl or 0.0) < 0:
                     self.consecutive_losses += 1
                 else:
                     break
