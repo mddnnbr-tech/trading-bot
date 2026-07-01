@@ -447,6 +447,26 @@ def has_open_position(symbol: str, side: str) -> bool:
     return any(t.symbol == symbol and t.side == side for t in open_positions())
 
 
+def epoch_start() -> str:
+    """Line-in-the-sand date for agent EVALUATION (not reporting).
+
+    Trades before this date were distorted by the duplicate-entry bug
+    (one bad signal re-entered 10-18x per tick, fixed 2026-07-01) and a
+    frozen risk circuit breaker — so per-agent P&L from that era measures
+    the bugs, not the agents. Evaluator and MetaAgent weighting only count
+    trades from this date; reports still show full history for pre/post
+    comparison. Override with LEDGER_EPOCH_START in .env if ever needed.
+    """
+    import os
+    return os.getenv("LEDGER_EPOCH_START", "2026-07-02")
+
+
+def epoch_trades() -> list[Trade]:
+    """All trades opened on/after the evaluation epoch."""
+    cutoff = epoch_start()
+    return [t for t in all_trades() if t.opened_at_et[:10] >= cutoff]
+
+
 def closed_trades() -> list[Trade]:
     return [t for t in all_trades() if not t.is_open]
 

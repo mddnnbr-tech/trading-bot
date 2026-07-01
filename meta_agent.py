@@ -275,7 +275,12 @@ class MetaAgent:
             cutoff_dt = datetime.now() - timedelta(days=20)
             cutoff_iso = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-            all_trades = _ledger.all_trades()
+            # Epoch-filtered (2026-07-02): pre-fix trades carry duplicate-
+            # amplified P&L that would mis-weight agents for weeks. This
+            # also naturally re-triggers the MIN_TRADES_FOR_WEIGHTING
+            # bootstrap: everyone runs at DEFAULT_WEIGHTS until 20 clean
+            # closed trades exist, then earned weighting resumes.
+            all_trades = _ledger.epoch_trades()
             closed = [t for t in all_trades if not t.is_open]
             if len(closed) < MIN_TRADES_FOR_WEIGHTING:
                 log.info(

@@ -147,7 +147,11 @@ class AgentEvaluator:
     """Reads the ledger and produces a ranked EvalReport."""
 
     def evaluate(self) -> EvalReport:
-        all_trades = _ledger.all_trades()
+        # Epoch-filtered: pre-2026-07-02 trades were distorted by the
+        # duplicate-entry bug, so they'd have agents benched for the bug's
+        # sins rather than their own. Full history remains in the ledger
+        # and in reports; it just doesn't vote on rotation anymore.
+        all_trades = _ledger.epoch_trades()
         active_state = _agent_active_state()
 
         # ── Window cutoffs (calendar days, ET) ────────────────────────────
