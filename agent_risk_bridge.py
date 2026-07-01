@@ -153,9 +153,13 @@ class AgentRiskBridge:
         }
 
         mode = "PAPER" if PAPER_TRADING else "LIVE"
+        size_label = (
+            f"{sizing['contracts']} contracts" if "contracts" in sizing
+            else f"{sizing['shares']} {sizing.get('instrument', 'shares')}"
+        )
         log.info(
             f"[{mode}] APPROVED: {symbol} {direction.upper()} "
-            f"conf={confidence:.2f} size={sizing['contracts']} contracts "
+            f"conf={confidence:.2f} size={size_label} "
             f"risk=${sizing['risk_amount']:.0f} tier={account_tier}"
         )
         return result
@@ -230,12 +234,17 @@ class AgentRiskBridge:
             if stop_distance <= 0 or entry <= 0:
                 return None
 
-            shares_by_risk    = dollar_risk / stop_distance
-            max_notional      = self.account_balance * (MAX_POSITION_SIZE_PCT / 100)
+            shares_by_risk     = dollar_risk / stop_distance
+            max_notional       = self.account_balance * (MAX_POSITION_SIZE_PCT / 100)
             shares_by_notional = max_notional / entry
+            raw_shares         = min(shares_by_risk, shares_by_notional)
 
-            shares = int(min(shares_by_risk, shares_by_notional))
-            if shares < 1:
+            # Crypto trades in fractional units (0.01 BTC is fine) — whole
+            # stocks don't. Truncating to int() for crypto turned any $1-2k
+            # notional cap into 0 whole coins, rejecting every trade.
+            is_crypto = instrument_type == "crypto"
+            shares = round(raw_shares, 6) if is_crypto else int(raw_shares)
+            if shares < (0.0001 if is_crypto else 1):
                 return None
 
             total_cost   = shares * entry
@@ -246,7 +255,7 @@ class AgentRiskBridge:
                 "total_cost":   round(total_cost, 2),
                 "risk_amount":  round(actual_risk, 2),
                 "risk_pct":     round((actual_risk / self.account_balance) * 100, 2),
-                "instrument":   "equity",
+                "instrument":   instrument_type,
                 "account_tier": account_tier,
             }
 

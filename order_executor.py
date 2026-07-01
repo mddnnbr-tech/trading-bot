@@ -97,8 +97,13 @@ class OrderExecutor:
         stop      = float(approved_signal.get("stop_loss_price", 0))
         target    = float(approved_signal.get("target_price", 0))
         agent     = approved_signal.get("agent", "Unknown")
-        pos_usd   = float(approved_signal.get("position_size_usd",
-                          PORTFOLIO_VALUE * MAX_POSITION_PCT / 100))
+        # Prefer the actual sizing AgentRiskBridge computed (risk-based,
+        # accounts for stop distance) over a flat default. Previously this
+        # always fell back to a fixed 2% notional regardless of what the
+        # risk bridge decided, silently ignoring its sizing math.
+        sizing    = approved_signal.get("position_sizing") or {}
+        pos_usd   = float(sizing.get("total_cost") or approved_signal.get(
+                          "position_size_usd", PORTFOLIO_VALUE * MAX_POSITION_PCT / 100))
 
         if entry <= 0:
             return self._reject("entry_price is 0 or missing")
