@@ -84,6 +84,7 @@ class Ensemble:
         from premarket_agent       import PremarketAgent
         from sector_rotation_agent import SectorRotationAgent
         from options_flow_agent    import OptionsFlowAgent
+        from volatility_agent      import VolatilityAgent
         from risk_agent            import RiskAgent
         from meta_agent            import MetaAgent
         from agent_risk_bridge     import AgentRiskBridge
@@ -103,6 +104,7 @@ class Ensemble:
             PremarketAgent(),
             SectorRotationAgent(),
             OptionsFlowAgent(),
+            VolatilityAgent(),
         ]
 
         self.risk   = RiskAgent()
