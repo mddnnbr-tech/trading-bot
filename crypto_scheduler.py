@@ -67,7 +67,14 @@ def run_crypto_tick() -> list[dict]:
     bridge = AgentRiskBridge(account_balance=ACCOUNT_BALANCE)
     approved = []
     for signal in signals:
-        side = "LONG" if signal["direction"] == "long" else "SHORT"
+        # Alpaca crypto is spot-only — no shorting. A "short" here would try
+        # to sell coins we don't hold, which always fails at the exchange.
+        # Skip gracefully rather than repeatedly hitting a doomed API call.
+        if signal["direction"] == "short":
+            log.info(f"⏭  SKIPPED: {signal['symbol']} short — Alpaca crypto is spot-only, shorting unsupported")
+            continue
+
+        side = "LONG"
         if _ledger.has_open_position(signal["symbol"], side):
             log.info(f"⏭  SKIPPED: {signal['symbol']} {signal['direction']} — already open")
             continue
