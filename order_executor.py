@@ -65,7 +65,15 @@ class OrderExecutor:
     Safe to call with PAPER_TRADING=true — all orders go to paper endpoint.
     """
 
+    # After Alpaca rejects an order (insufficient buying power, bracket
+    # conflicts, etc.), don't retry that symbol/side for this long. Failed
+    # orders never reach the ledger, so the dedup gate can't see them —
+    # without this, one rejected signal got re-approved and re-submitted
+    # every 60s tick all day (1,830 doomed submissions on 2026-07-08).
+    FAILURE_COOLDOWN_SEC = 3600
+
     def __init__(self):
+        self._failed_at: dict[tuple[str, str], float] = {}
         if not _ALPACA_OK:
             self._client = None
             return
@@ -112,6 +120,15 @@ class OrderExecutor:
         if self._client is None:
             return self._log_only(approved_signal)
 
+        import time
+        cooldown_key = (symbol, direction)
+        failed_at = self._failed_at.get(cooldown_key)
+        if failed_at and (time.time() - failed_at) < self.FAILURE_COOLDOWN_SEC:
+            remaining = int((self.FAILURE_COOLDOWN_SEC - (time.time() - failed_at)) / 60)
+            log.info(f"⏳ COOLDOWN: {symbol} {direction.upper()} — last submission "
+                     f"failed, retrying in ~{remaining}m")
+            return {"status": "cooldown", "symbol": symbol, "direction": direction}
+
         is_crypto = symbol in CRYPTO_SYMBOLS
 
         try:
@@ -132,6 +149,7 @@ class OrderExecutor:
 
         except Exception as e:
             log.error(f"Order submission failed for {symbol}: {e}", exc_info=True)
+            self._failed_at[cooldown_key] = time.time()
             return self._log_only(approved_signal)
 
     # ── Equity bracket order ──────────────────────────────────────────────────

@@ -183,15 +183,17 @@ class Ensemble:
         approved = []
         for signal in synthesized:
             try:
-                # Dedup gate: don't re-enter a symbol/direction we already
-                # hold. Without this, one bad signal repeats every tick and
-                # turns a single -$35 stop into a dozen duplicate positions.
+                # Dedup gate: one open position per symbol, either side.
+                # Same-side re-entry caused the duplicate-position pileup;
+                # opposite-side entry fails anyway at Alpaca ("bracket orders
+                # must be entry orders" — a new bracket can't open against an
+                # existing position it would partially close). Block both.
                 import trade_ledger as _ledger
-                side = "LONG" if signal["direction"] == "long" else "SHORT"
-                if _ledger.has_open_position(signal["symbol"], side):
+                if (_ledger.has_open_position(signal["symbol"], "LONG")
+                        or _ledger.has_open_position(signal["symbol"], "SHORT")):
                     log.info(
                         f"⏭  SKIPPED: {signal['symbol']:6} {signal['direction']:5} "
-                        f"— already have an open {side} position"
+                        f"— already have an open position on this symbol"
                     )
                     continue
 
