@@ -72,6 +72,7 @@ DEFAULT_WEIGHTS = {
     "SectorRotationAgent": 1.0,
     "OptionsFlowAgent":    1.0,
     "VolatilityAgent":     1.0,
+    "IntermarketAgent":    1.0,
 }
 # Note: RiskAgent is a monitor only — not a signal source
 

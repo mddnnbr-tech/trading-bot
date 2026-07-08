@@ -51,22 +51,23 @@ ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY", "")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 ALPACA_PAPER      = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
-# Symbols to stream — union of all agent watchlists
+# Symbols to stream — capped at 28 to stay under IEX free-tier's ~30-symbol
+# subscription limit. The old 46-symbol list (x3 channels) blew past the cap
+# and the stream threw "symbol limit exceeded (405)" — silently degrading the
+# only true real-time feed the system has. Leveraged ETFs and crypto removed:
+# leveraged ETFs just mirror SPY/QQQ moves the surge scanner already sees, and
+# crypto isn't served by the equity IEX stream at all (has its own scheduler).
 DEFAULT_SYMBOLS = [
     # Major ETFs
-    "SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLI", "XLU", "XLP",
+    "SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XLV", "XLI",
     # Mega-cap tech
     "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AMD",
     # High-momentum / high-volume
-    "PLTR", "COIN", "SOFI", "SMCI", "AVGO", "CRWD", "PANW", "SNOW",
-    # Broad market movers
-    "NFLX", "UBER", "ABNB", "SHOP", "XOM", "RBLX",
-    # Leveraged ETFs — 3x bull/bear, all-weather
-    "TQQQ", "SQQQ", "UPRO", "SPXU", "TNA", "TZA", "LABU", "LABD",
+    "PLTR", "COIN", "NFLX", "UBER", "AVGO",
+    # Energy majors (intermarket agent's oil beneficiaries)
+    "XOM", "CVX",
     # Macro hedges
     "GLD", "TLT", "UUP",
-    # Crypto (Alpaca format)
-    "BTC/USD", "ETH/USD", "SOL/USD",
 ]
 
 MAX_BARS_PER_SYMBOL = 100  # keep last N 1-minute bars in memory
@@ -235,7 +236,10 @@ def _stream_loop(symbols: list[str]):
 
             stream.subscribe_trades(handle_trade, *symbols)
             stream.subscribe_bars(handle_bar, *symbols)
-            stream.subscribe_quotes(handle_quote, *symbols)
+            # Quotes deliberately NOT subscribed: nothing downstream reads
+            # bid/ask (surge detection uses bars, price cache uses trades),
+            # and the quotes channel tripled subscription count against the
+            # IEX limit — it was the main driver of the 405 errors.
 
             log.info("AlpacaStream: connected — receiving live data")
             backoff = 5  # reset on successful connect

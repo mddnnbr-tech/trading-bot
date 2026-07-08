@@ -85,6 +85,7 @@ class Ensemble:
         from sector_rotation_agent import SectorRotationAgent
         from options_flow_agent    import OptionsFlowAgent
         from volatility_agent      import VolatilityAgent
+        from intermarket_agent     import IntermarketAgent
         from risk_agent            import RiskAgent
         from meta_agent            import MetaAgent
         from agent_risk_bridge     import AgentRiskBridge
@@ -105,6 +106,7 @@ class Ensemble:
             SectorRotationAgent(),
             OptionsFlowAgent(),
             VolatilityAgent(),
+            IntermarketAgent(),
         ]
 
         self.risk   = RiskAgent()
