@@ -210,7 +210,15 @@ class OrderExecutor:
             entry  = float(signal.get("entry_price", 0))
             stop   = float(signal.get("stop_loss_price", 0))
             target = float(signal.get("target_price", 0))
-            risk   = abs(entry - stop) * order_result.get("qty", 1)
+            # Crypto orders are notional (no qty) — derive fractional shares
+            # from notional/entry so the ledger can compute real P&L. With
+            # shares recorded as 0, unrealized P&L multiplied by zero and
+            # crypto positions were invisible to every downstream evaluator.
+            qty = order_result.get("qty")
+            if not qty and entry > 0:
+                qty = round(float(order_result.get("notional", 0)) / entry, 8)
+            qty  = qty or 0
+            risk = abs(entry - stop) * qty
             _ledger.record_trade(
                 symbol        = signal["symbol"],
                 side          = signal.get("direction", "long"),
@@ -218,7 +226,7 @@ class OrderExecutor:
                 target_price  = target,
                 stop_price    = stop,
                 risk_dollar   = risk,
-                shares        = order_result.get("qty", 0),
+                shares        = qty,
                 primary_agent = signal.get("agent", "MetaAgent"),
                 contributors  = signal.get("contributing_agents", ""),
                 order_id      = order_result.get("order_id", ""),

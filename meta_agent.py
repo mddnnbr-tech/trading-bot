@@ -120,6 +120,24 @@ class MetaAgent:
         # Step 2: Group by (symbol, direction) and merge agreements
         merged = self._merge_signals(weighted)
 
+        # Step 2b: Shorts must be corroborated. Across both the pre-fix era
+        # (SPOT/QQQ/SPY/PLTR shorts repeatedly stopped out) and the clean
+        # epoch (shorts 1W-3L vs longs 3W-1L in week one), solo-agent shorts
+        # are the ensemble's consistent loser — while the one winning short
+        # (QQQ, 3 agents) was corroborated. Longs may pass solo; a short
+        # needs 2+ agreeing agents until the data earns it back.
+        kept = []
+        for s in merged:
+            if s["direction"] == "short" and s.get("agent_count", 1) < 2:
+                log.info(
+                    f"MetaAgent: dropped solo short {s['symbol']} "
+                    f"({s.get('original_agent', s.get('agent', '?'))}) — "
+                    f"shorts require 2+ agent consensus"
+                )
+                continue
+            kept.append(s)
+        merged = kept
+
         # Step 3: Cancel conflicting signals on the same symbol
         if CONFLICT_CANCEL:
             merged = self._cancel_conflicts(merged)

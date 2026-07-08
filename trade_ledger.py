@@ -280,6 +280,13 @@ def _import_yf():
         return None
 
 
+# Alpaca order format (slash) → yfinance fetch format (dash). Without this
+# mapping, yf.Ticker("BTC/USD") 404s silently and crypto positions never get
+# priced — unrealized P&L stays 0.0 forever and the evaluator judges
+# CryptoAgent on fake zeros.
+_YF_SYMBOL_MAP = {"BTC/USD": "BTC-USD", "ETH/USD": "ETH-USD", "SOL/USD": "SOL-USD"}
+
+
 def _fetch_price_path(symbol: str, since_iso_et: str, yf) -> Optional[object]:
     """Return a DataFrame of price bars from `since` through now, or None."""
     try:
@@ -292,7 +299,7 @@ def _fetch_price_path(symbol: str, since_iso_et: str, yf) -> Optional[object]:
     period    = f"{min(days_held + 2, 60)}d"
     interval  = "5m" if days_held <= 5 else "1d"
     try:
-        df = yf.Ticker(symbol).history(period=period, interval=interval)
+        df = yf.Ticker(_YF_SYMBOL_MAP.get(symbol, symbol)).history(period=period, interval=interval)
         if df is None or df.empty:
             return None
         # Localize index to ET
