@@ -168,7 +168,13 @@ class OrderExecutor:
             symbol=symbol,
             qty=qty,
             side=side,
-            time_in_force=TimeInForce.DAY,
+            # GTC, not DAY: with DAY, the bracket's stop/target children
+            # expired every afternoon — any position that survived past one
+            # session was left with NO exit orders at the broker while the
+            # ledger merely simulated closes. That drift is how legacy
+            # positions accumulated $341k of gross exposure and froze the
+            # account at $0 buying power (2026-07-08).
+            time_in_force=TimeInForce.GTC,
             order_class=OrderClass.BRACKET,
             take_profit=TakeProfitRequest(limit_price=round(target, 2)),
             stop_loss=StopLossRequest(stop_price=round(stop, 2)),
