@@ -134,6 +134,44 @@ def check_ledger_fresh() -> list[str]:
     return []
 
 
+def check_broker_ledger_drift() -> list[str]:
+    """Flag Alpaca positions the ledger thinks are closed (orphans).
+
+    Root cause this guards against (found 2026-07-09): bracket exit orders
+    are day-only — they expire each close, the ledger simulates the exit,
+    but the real position persists at the broker. Drift compounded until
+    legacy positions held $341k gross exposure and buying power hit $0,
+    silently freezing all new trading."""
+    try:
+        import trade_ledger as _ledger
+        from alpaca.trading.client import TradingClient
+        key, secret = os.getenv("ALPACA_API_KEY", ""), os.getenv("ALPACA_API_SECRET", "")
+        if not key or not secret:
+            return []
+        client = TradingClient(api_key=key, secret_key=secret, paper=True)
+
+        ledger_open = {t.symbol.replace("/", "") for t in _ledger.open_positions()}
+        broker_open = {str(p.symbol) for p in client.get_all_positions()}
+        orphans = broker_open - ledger_open
+
+        issues = []
+        if orphans:
+            issues.append(
+                f"WARNING: broker/ledger drift — Alpaca holds positions the ledger "
+                f"already closed: {', '.join(sorted(orphans))}. These consume buying "
+                f"power invisibly; close them or reconcile the ledger."
+            )
+        bp = float(client.get_account().buying_power)
+        if bp < 1000:
+            issues.append(
+                f"CRITICAL: buying power ${bp:,.0f} — the bot cannot open new "
+                f"positions. Check for drift/orphan positions above."
+            )
+        return issues
+    except Exception as e:
+        return [f"WARNING: could not check broker/ledger drift ({e})"]
+
+
 def check_email_auth() -> list[str]:
     """Verify Gmail SMTP creds actually authenticate (cheap, no email sent)."""
     if not GMAIL_ADDRESS or not GMAIL_APP_PW:
@@ -184,6 +222,7 @@ def main():
     issues += check_bot_alive()
     issues += check_duplicate_positions()
     issues += check_ledger_fresh()
+    issues += check_broker_ledger_drift()
     issues += check_email_auth()
 
     if issues:
