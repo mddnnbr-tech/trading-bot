@@ -147,6 +147,23 @@ class MetaAgent:
             kept.append(s)
         merged = kept
 
+        # Step 2c: Catalyst alignment — fresh news PLUS live price
+        # confirmation on the same symbol is the highest-value pattern in
+        # the book: it's how you catch the move at +2% while it's still
+        # becoming +10%. Boost it so it outranks slower setups for the
+        # day's limited entry slots.
+        for s in merged:
+            contribs = str(s.get("contributing_agents", s.get("agent", "")))
+            if "NewsAgent" in contribs and any(
+                a in contribs for a in
+                ("AlpacaSurgeDetector", "MomentumAgent", "PremarketAgent")
+            ):
+                s["confidence"] = round(min(s["confidence"] + 0.08, 0.95), 4)
+                s.setdefault("reasons", []).append(
+                    "catalyst alignment: fresh news + live price confirmation")
+                log.info(f"MetaAgent: catalyst boost {s['symbol']} "
+                         f"{s['direction']} → conf {s['confidence']:.2f}")
+
         # Step 3: Cancel conflicting signals on the same symbol
         if CONFLICT_CANCEL:
             merged = self._cancel_conflicts(merged)

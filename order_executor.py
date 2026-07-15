@@ -152,43 +152,57 @@ class OrderExecutor:
             self._failed_at[cooldown_key] = time.time()
             return self._log_only(approved_signal)
 
-    # ── Equity bracket order ──────────────────────────────────────────────────
+    # ── Equity entry + trailing-stop exit ─────────────────────────────────────
     def _submit_equity_bracket(
         self, symbol: str, direction: str,
         entry: float, stop: float, target: float, pos_usd: float
     ) -> dict:
-        qty = max(1, int(pos_usd / entry))   # whole shares only for bracket
-        side = OrderSide.BUY if direction == "long" else OrderSide.SELL
+        """Market entry + GTC TRAILING stop. No fixed take-profit.
 
-        # Build bracket: entry is market, stop and target are limit/stop
-        # alpaca-py v0.8+ uses nested request objects for bracket
-        from alpaca.trading.requests import TakeProfitRequest, StopLossRequest
+        The asymmetry mandate (2026-07-15): a fixed take-profit sold every
+        winner at +3-4% and forfeited the runners — a stock that goes on
+        to +10% paid the same as one that stalled at the target. The
+        trailing stop cuts losers at roughly the ATR stop distance, but
+        ratchets up behind the high-water mark on winners and only fires
+        on a real reversal. Losses stay capped; wins are uncapped. That
+        asymmetry is the entire engine of a compounding account.
+        """
+        qty       = max(1, int(pos_usd / entry))
+        side      = OrderSide.BUY  if direction == "long" else OrderSide.SELL
+        exit_side = OrderSide.SELL if direction == "long" else OrderSide.BUY
+        # Trail distance = the ATR stop distance as a percent, clamped 2-6%
+        trail_pct = round(min(max(abs(entry - stop) / entry * 100, 2.0), 6.0), 2)
 
-        req = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=side,
-            # GTC, not DAY: with DAY, the bracket's stop/target children
-            # expired every afternoon — any position that survived past one
-            # session was left with NO exit orders at the broker while the
-            # ledger merely simulated closes. That drift is how legacy
-            # positions accumulated $341k of gross exposure and froze the
-            # account at $0 buying power (2026-07-08).
-            time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=round(target, 2)),
-            stop_loss=StopLossRequest(stop_price=round(stop, 2)),
-        )
-        order = self._client.submit_order(req)
+        entry_order = self._client.submit_order(MarketOrderRequest(
+            symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
+        ))
+
+        # Wait for the fill so the trailing stop isn't rejected for missing qty
+        import time as _t
+        for _ in range(10):
+            o = self._client.get_order_by_id(entry_order.id)
+            if str(o.status).lower().endswith("filled"):
+                break
+            _t.sleep(1)
+
+        from alpaca.trading.requests import TrailingStopOrderRequest
+        trail_order = self._client.submit_order(TrailingStopOrderRequest(
+            symbol=symbol, qty=qty, side=exit_side,
+            trail_percent=trail_pct, time_in_force=TimeInForce.GTC,
+        ))
+        log.info(f"🪤 TRAIL SET: {symbol} exit trails {trail_pct}% behind "
+                 f"high-water mark (order {trail_order.id}) — upside uncapped")
+
         return {
-            "status":    "submitted",
-            "order_id":  str(order.id),
-            "symbol":    symbol,
-            "direction": direction,
-            "qty":       qty,
-            "entry":     entry,
-            "stop":      stop,
-            "target":    target,
+            "status":       "submitted",
+            "order_id":     str(entry_order.id),
+            "symbol":       symbol,
+            "direction":    direction,
+            "qty":          qty,
+            "entry":        entry,
+            "stop":         stop,
+            "target":       target,       # bookkeeping marker only — real exit is the trail
+            "trail_percent": trail_pct,
         }
 
     # ── Crypto market order ───────────────────────────────────────────────────

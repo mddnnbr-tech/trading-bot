@@ -336,12 +336,16 @@ class Ensemble:
             if atr <= 0 or entry <= 0:
                 return signal
             stop_dist = max(1.5 * atr, entry * 0.01)
+            # target_price is a distant bookkeeping marker (4x stop) — the
+            # real exit is the broker-side trailing stop, which is uncapped
+            # on winners. Keeping the marker far out stops the ledger's
+            # price simulation from fake-closing runners at +2.5 ATR.
             if signal.get("direction") == "long":
                 signal["stop_loss_price"] = round(entry - stop_dist, 2)
-                signal["target_price"]    = round(entry + stop_dist * (2.5 / 1.5), 2)
+                signal["target_price"]    = round(entry + stop_dist * 4.0, 2)
             else:
                 signal["stop_loss_price"] = round(entry + stop_dist, 2)
-                signal["target_price"]    = round(entry - stop_dist * (2.5 / 1.5), 2)
+                signal["target_price"]    = round(entry - stop_dist * 4.0, 2)
         except Exception:
             pass
         return signal
