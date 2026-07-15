@@ -183,6 +183,13 @@ class Ensemble:
         approved = []
         for signal in synthesized:
             try:
+                # Normalize stop/target to the symbol's real volatility.
+                # The fixed 2%-stop/5%-target geometry killed the clean
+                # epoch: 39 of 49 trades stopped out on ordinary intraday
+                # noise (20% win rate vs the 29% that geometry requires).
+                # ATR-derived levels give volatile names room to breathe
+                # and quiet names tighter, reachable targets.
+                signal = self._normalize_geometry(signal)
                 # Dedup gate: one open position per symbol, either side.
                 # Same-side re-entry caused the duplicate-position pileup;
                 # opposite-side entry fails anyway at Alpaca ("bracket orders
@@ -271,6 +278,46 @@ class Ensemble:
                 "timestamp":       datetime.now(timezone.utc).isoformat(),
             })
         return signals
+
+    @staticmethod
+    def _normalize_geometry(signal: dict) -> dict:
+        """Re-derive stop/target from daily ATR(14): stop 1.5x, target 2.5x.
+
+        Daily bars, not 5-minute — positions are held for days under GTC
+        brackets, so the stop must survive a normal day's range. Breakeven
+        win rate at this 1.5:2.5 geometry is 37.5%. Floor of 1% of entry
+        guards against ultra-quiet symbols producing paper-thin stops.
+        Falls back to the agent's own levels if data is unavailable.
+        """
+        symbol = signal.get("symbol", "")
+        if "/" in symbol:            # crypto — its own scheduler handles it
+            return signal
+        try:
+            import pandas as pd
+            import yfinance as yf
+            df = yf.Ticker(symbol).history(period="3mo", interval="1d")
+            if df is None or len(df) < 20:
+                return signal
+            prev_close = df["Close"].shift(1)
+            tr = pd.concat([
+                df["High"] - df["Low"],
+                (df["High"] - prev_close).abs(),
+                (df["Low"] - prev_close).abs(),
+            ], axis=1).max(axis=1)
+            atr = float(tr.rolling(14).mean().iloc[-1])
+            entry = float(signal.get("entry_price") or 0)
+            if atr <= 0 or entry <= 0:
+                return signal
+            stop_dist = max(1.5 * atr, entry * 0.01)
+            if signal.get("direction") == "long":
+                signal["stop_loss_price"] = round(entry - stop_dist, 2)
+                signal["target_price"]    = round(entry + stop_dist * (2.5 / 1.5), 2)
+            else:
+                signal["stop_loss_price"] = round(entry + stop_dist, 2)
+                signal["target_price"]    = round(entry - stop_dist * (2.5 / 1.5), 2)
+        except Exception:
+            pass
+        return signal
 
     def _log_paper_trade(self, approved_signal: dict):
         symbol    = approved_signal.get("symbol", "")

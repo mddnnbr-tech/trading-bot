@@ -48,11 +48,15 @@ from typing import Optional, Set
 log = logging.getLogger("MetaAgent")
 
 # ── Synthesis config ────────────────────────────────────────────────────────
-CONSENSUS_THRESHOLD    = 0.45   # lowered from 0.50 — pass more signals during bootstrap
+CONSENSUS_THRESHOLD    = 0.55   # raised from 0.45 — clean-epoch data showed volume
+                                # of low-conviction trades was pure bleed (20% WR)
 CONFLICT_CANCEL        = False  # keep dominant direction instead of cancelling
 AGREEMENT_BONUS        = 0.10   # raised: extra boost when multiple agents agree
-MAX_SIGNALS_PER_TICK   = 8      # more concurrent positions = more chances to win
-MIN_AGENT_WEIGHT       = 0.65   # raised from 0.15 — no agent is penalized until 20+ closed trades
+MAX_SIGNALS_PER_TICK   = 4      # halved from 8 — fewer, higher-conviction positions
+MIN_AGENT_WEIGHT       = 0.40   # lowered from 0.65 — losing agents must actually
+                                # lose influence, or the weighting layer teaches nothing
+MIN_SOLO_CONFIDENCE    = 0.70   # a signal with only one agent behind it needs strong
+                                # standalone conviction; consensus signals pass normally
 PROFIT_WEIGHT_EXPONENT = 0.6    # power curve — top earners rewarded more
 REGIME_BOOST           = 0.25   # weight bonus for agents in their best regime
 MIN_TRADES_FOR_WEIGHTING = 20   # don't apply P&L weighting until we have real data
@@ -121,20 +125,22 @@ class MetaAgent:
         # Step 2: Group by (symbol, direction) and merge agreements
         merged = self._merge_signals(weighted)
 
-        # Step 2b: Shorts must be corroborated. Across both the pre-fix era
-        # (SPOT/QQQ/SPY/PLTR shorts repeatedly stopped out) and the clean
-        # epoch (shorts 1W-3L vs longs 3W-1L in week one), solo-agent shorts
-        # are the ensemble's consistent loser — while the one winning short
-        # (QQQ, 3 agents) was corroborated. Longs may pass solo; a short
-        # needs 2+ agreeing agents until the data earns it back.
+        # Step 2b: Every trade must earn its way in. Clean-epoch data
+        # (49 closed trades, 20% win rate, ALL agents negative) showed the
+        # bleed came from volume of solo low-conviction signals. New rule:
+        # a signal passes only with 2+ agreeing agents, OR a single agent
+        # at >= MIN_SOLO_CONFIDENCE conviction. Shorts stay stricter —
+        # always 2+ agents (solo shorts have lost in every era).
         kept = []
         for s in merged:
-            if s["direction"] == "short" and s.get("agent_count", 1) < 2:
-                log.info(
-                    f"MetaAgent: dropped solo short {s['symbol']} "
-                    f"({s.get('original_agent', s.get('agent', '?'))}) — "
-                    f"shorts require 2+ agent consensus"
-                )
+            n_agents = s.get("agent_count", 1)
+            if s["direction"] == "short" and n_agents < 2:
+                log.info(f"MetaAgent: dropped solo short {s['symbol']} — "
+                         f"shorts require 2+ agent consensus")
+                continue
+            if n_agents < 2 and s["confidence"] < MIN_SOLO_CONFIDENCE:
+                log.info(f"MetaAgent: dropped solo {s['direction']} {s['symbol']} "
+                         f"(conf {s['confidence']:.2f} < {MIN_SOLO_CONFIDENCE} solo bar)")
                 continue
             kept.append(s)
         merged = kept
