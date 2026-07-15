@@ -52,7 +52,9 @@ CONSENSUS_THRESHOLD    = 0.55   # raised from 0.45 — clean-epoch data showed v
                                 # of low-conviction trades was pure bleed (20% WR)
 CONFLICT_CANCEL        = False  # keep dominant direction instead of cancelling
 AGREEMENT_BONUS        = 0.10   # raised: extra boost when multiple agents agree
-MAX_SIGNALS_PER_TICK   = 4      # halved from 8 — fewer, higher-conviction positions
+MAX_SIGNALS_PER_TICK   = 2      # top-2 per tick; combined with the ensemble's
+                                # 4/day cap, entries spread across the day's best
+                                # setups instead of all filling at the open
 MIN_AGENT_WEIGHT       = 0.40   # lowered from 0.65 — losing agents must actually
                                 # lose influence, or the weighting layer teaches nothing
 MIN_SOLO_CONFIDENCE    = 0.70   # a signal with only one agent behind it needs strong

@@ -39,6 +39,12 @@ log = logging.getLogger("Ensemble")
 PAPER_TRADING   = os.getenv("PAPER_TRADING", "true").lower() == "true"
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "16000"))
 
+# Hard cap on NEW equity entries per trading day. The concentrated-risk
+# mandate (2026-07-15): 3-4 big high-conviction trades a day, not a stream
+# of small ones — Jul 13 alone opened 15 positions under per-tick caps,
+# which is exactly the bleed pattern the clean-epoch data convicted.
+DAILY_TRADE_CAP = int(os.getenv("DAILY_TRADE_CAP", "4"))
+
 AGENT_SUMMARY_PATH = Path(__file__).resolve().parent / "logs" / "agent_summary.json"
 
 # ── Start Alpaca streaming at import time ─────────────────────────────────────
@@ -136,6 +142,22 @@ class Ensemble:
             log.warning(f"TRADING HALTED: {risk_status['warnings']}")
             return []
 
+        # Step 2a: daily entry budget — once DAILY_TRADE_CAP equity positions
+        # have opened today, we're done adding risk until tomorrow.
+        try:
+            import trade_ledger as _tl
+            from datetime import datetime as _dt
+            _today = _dt.now(_tl.ET).strftime("%Y-%m-%d")
+            opened_today = len([t for t in _tl.trades_on_date(_today)
+                                if "/" not in t.symbol])
+        except Exception:
+            opened_today = 0
+        entries_remaining = DAILY_TRADE_CAP - opened_today
+        if entries_remaining <= 0:
+            log.info(f"Daily trade cap reached ({opened_today}/{DAILY_TRADE_CAP}) "
+                     f"— managing open positions only, no new entries today")
+            return []
+
         # Step 3: gather signals from active agents
         benched = _load_benched_agent_names()
         skipped: list[str] = []
@@ -203,6 +225,11 @@ class Ensemble:
                         f"— already have an open position on this symbol"
                     )
                     continue
+
+                if len(approved) >= entries_remaining:
+                    log.info(f"⏭  Daily entry budget exhausted this tick "
+                             f"({DAILY_TRADE_CAP}/day) — skipping remaining signals")
+                    break
 
                 result = self.bridge.evaluate_signal(signal)
                 if result["approved"]:
