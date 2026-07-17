@@ -218,6 +218,14 @@ class MetaAgent:
 
         # Step 6: Add meta_score and mark as synthesized
         for s in passed:
+            # Solo specialists that cleared the raw-conviction bar carry
+            # their RAW conviction downstream — otherwise the risk bridge's
+            # own 0.50 confidence floor re-applies the weight penalty a
+            # third time and rejects what synthesis just admitted
+            # (XOM/XLE at weighted 0.42 vs raw 0.66, 2026-07-17).
+            if (s.get("agent_count", 1) == 1
+                    and s.get("raw_confidence", 0.0) >= MIN_SOLO_CONFIDENCE):
+                s["confidence"] = s["raw_confidence"]
             s["meta_score"]    = s["confidence"]
             s["synthesized_by"] = self.name
             s["agent"]          = f"MetaAgent({s.get('contributing_agents', s['agent'])})"
