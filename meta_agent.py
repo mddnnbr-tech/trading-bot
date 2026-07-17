@@ -57,6 +57,9 @@ MAX_SIGNALS_PER_TICK   = 2      # top-2 per tick; combined with the ensemble's
                                 # setups instead of all filling at the open
 MIN_AGENT_WEIGHT       = 0.40   # lowered from 0.65 — losing agents must actually
                                 # lose influence, or the weighting layer teaches nothing
+SOLO_SHORT_CONFIDENCE  = 0.72   # crash exception: a solo short passes only at
+                                # this raw conviction (movers scale: an 11%+
+                                # intraday collapse on heavy volume)
 MIN_SOLO_CONFIDENCE    = 0.65   # calibrated 2026-07-17: the catalyst specialists
                                 # (Intermarket/Volatility) scale 0.55-0.80 and only
                                 # exceed 0.70 on extreme moves — a +2.3% WTI day
@@ -84,6 +87,7 @@ DEFAULT_WEIGHTS = {
     "OptionsFlowAgent":    1.0,
     "VolatilityAgent":     1.0,
     "IntermarketAgent":    1.0,
+    "MoversAgent":         1.0,
 }
 # Note: RiskAgent is a monitor only — not a signal source
 
@@ -142,9 +146,21 @@ class MetaAgent:
         for s in merged:
             n_agents = s.get("agent_count", 1)
             if s["direction"] == "short" and n_agents < 2:
-                log.info(f"MetaAgent: dropped solo short {s['symbol']} — "
-                         f"shorts require 2+ agent consensus")
-                continue
+                # Crash exception: consensus is impossible on dynamic-universe
+                # symbols only MoversAgent covers (new listings, screen-only
+                # names — e.g. SPCX post-IPO collapse). A stock down 11%+ on
+                # heavy volume (raw conf >= SOLO_SHORT_CONFIDENCE on the
+                # movers scale) is a different animal from the solo technical
+                # shorts that lost money in an up tape; those stay blocked.
+                _raw = s.get("raw_confidence", s["confidence"])
+                if _raw >= SOLO_SHORT_CONFIDENCE:
+                    log.info(f"MetaAgent: solo short {s['symbol']} admitted via "
+                             f"crash exception (raw conf {_raw:.2f})")
+                else:
+                    log.info(f"MetaAgent: dropped solo short {s['symbol']} — "
+                             f"shorts need 2+ agents (or raw conf >= "
+                             f"{SOLO_SHORT_CONFIDENCE})")
+                    continue
             # Solo conviction is judged on the agent's RAW confidence, not
             # the performance-weighted one. Judging post-weight created a
             # death spiral for solo specialists (Intermarket/Volatility/
