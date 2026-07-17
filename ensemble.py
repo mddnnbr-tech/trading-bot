@@ -160,6 +160,25 @@ class Ensemble:
                      f"— managing open positions only, no new entries today")
             return []
 
+        # Step 2b: dynamic universe injection — the whole market via funnel.
+        # Static watchlists cover ~40 core names; the market-wide screens
+        # (gainers/losers/most-active) find whatever ELSE is moving today —
+        # any listed stock, IPOs included — and inject it into the scanning
+        # agents' watchlists for this tick. This is how "look at all stocks"
+        # actually works at 60s ticks: cheap screens select the active
+        # subset, the full agent stack analyzes it, and multi-agent
+        # consensus (incl. corroborated shorts) becomes possible on names
+        # no static list ever contained.
+        dynamic = self._dynamic_universe()
+        if dynamic:
+            for agent in self.agents:
+                wl = getattr(agent, "watchlist", None)
+                if isinstance(wl, list):
+                    if not hasattr(agent, "_base_watchlist"):
+                        agent._base_watchlist = list(wl)
+                    agent.watchlist = agent._base_watchlist + [
+                        s for s in dynamic if s not in agent._base_watchlist]
+
         # Step 3: gather signals from active agents
         benched = _load_benched_agent_names()
         skipped: list[str] = []
@@ -307,6 +326,43 @@ class Ensemble:
                 "timestamp":       datetime.now(timezone.utc).isoformat(),
             })
         return signals
+
+    _universe_cache: tuple[float, list[str]] = (0.0, [])
+
+    def _dynamic_universe(self, max_symbols: int = 15) -> list[str]:
+        """Today's hottest listed stocks from market-wide screens.
+
+        Cached 5 minutes — the set of names worth deep analysis doesn't
+        change tick-to-tick, and each injected symbol costs the scanning
+        agents a data fetch. Filters: $5+ price, 500k+ volume, plain US
+        listings only.
+        """
+        import time
+        ts, cached = Ensemble._universe_cache
+        if time.time() - ts < 300:
+            return cached
+        symbols: list[str] = []
+        try:
+            import yfinance as yf
+            for screen in ("day_gainers", "day_losers", "most_actives"):
+                try:
+                    for q in (yf.screen(screen).get("quotes") or [])[:10]:
+                        sym   = q.get("symbol", "")
+                        price = float(q.get("regularMarketPrice") or 0)
+                        vol   = float(q.get("regularMarketVolume") or 0)
+                        if (sym and "." not in sym and "-" not in sym
+                                and price >= 5 and vol >= 500_000
+                                and sym not in symbols):
+                            symbols.append(sym)
+                except Exception:
+                    continue
+        except Exception as e:
+            log.debug(f"dynamic universe unavailable: {e}")
+        symbols = symbols[:max_symbols]
+        Ensemble._universe_cache = (time.time(), symbols)
+        if symbols:
+            log.info(f"🌐 Dynamic universe this tick: {', '.join(symbols)}")
+        return symbols
 
     @staticmethod
     def _normalize_geometry(signal: dict) -> dict:
