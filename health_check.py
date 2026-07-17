@@ -216,6 +216,33 @@ def send_alert(issues: list[str]) -> None:
             pass  # if email itself is broken, Slack alert above is the fallback
 
 
+def _should_alert(issues: list[str]) -> bool:
+    """Alert policy: email/Slack ONLY for CRITICAL findings, and never
+    re-alert the same set of problems more than once per 6 hours.
+
+    Why: the hourly cron re-emailed the same known WARNING every hour
+    (4 duplicate emails on 2026-07-17 for a drift issue that already had
+    an automated fix scheduled). Warnings are logged and auto-remediated
+    by the daily reconcile; they don't page the human."""
+    import hashlib, json, time
+    criticals = [i for i in issues if i.startswith("CRITICAL")]
+    if not criticals:
+        return False
+
+    state_path = BASE_DIR / "logs" / "health_state.json"
+    digest = hashlib.sha256("|".join(sorted(issues)).encode()).hexdigest()
+    now = time.time()
+    try:
+        prev = json.loads(state_path.read_text())
+    except Exception:
+        prev = {}
+    if prev.get("digest") == digest and now - prev.get("ts", 0) < 6 * 3600:
+        return False
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"digest": digest, "ts": now}))
+    return True
+
+
 def main():
     issues: list[str] = []
     issues += check_and_fix_env_duplicates()
@@ -229,7 +256,10 @@ def main():
         print(f"Health check found {len(issues)} issue(s):")
         for i in issues:
             print(f"  • {i}")
-        send_alert(issues)
+        if _should_alert(issues):
+            send_alert(issues)
+        else:
+            print("(logged only — no critical findings or already alerted within 6h)")
     else:
         print(f"✅ Health check passed — {datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')}")
 
