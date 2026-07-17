@@ -318,6 +318,16 @@ def sync_alpaca_positions():
             for p in client.get_all_positions():
                 sym = str(p.symbol)
                 if sym not in ledger_open:
+                    # Stale exit orders (old brackets/trails) hold the qty
+                    # and make close_position fail with "insufficient qty
+                    # available" — cancel them first, then liquidate.
+                    try:
+                        stale = client.get_orders(GetOrdersRequest(
+                            status=QueryOrderStatus.OPEN, symbols=[sym]))
+                        for o in stale:
+                            client.cancel_order_by_id(o.id)
+                    except Exception:
+                        pass
                     client.close_position(sym)
                     log.info(f"Reconcile: closed orphan broker position {sym} "
                              f"(ledger already exited it)")
