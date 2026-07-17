@@ -43,8 +43,9 @@ WATCHLIST = [
     "NFLX", "UBER", "ABNB", "SHOP", "XOM", "RBLX",
     # Leveraged ETFs — 3x bull/bear for all-weather trading
     "TQQQ", "SQQQ", "UPRO", "SPXU", "TNA", "TZA", "LABU", "LABD",
-    # Crypto — 24/7 market, high volatility, real opportunities
-    "BTC/USD", "ETH/USD", "SOL/USD",
+    # NOTE: crypto removed — CryptoAgent owns BTC/ETH/SOL on its own 24/7
+    # scheduler. Scanning slash-format symbols here just threw a yfinance
+    # 404 every tick (~175 log errors/day) and never produced a signal.
 ]
 
 # ── Indicator parameters ──────────────────────────────────────────────────

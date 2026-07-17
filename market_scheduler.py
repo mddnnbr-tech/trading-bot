@@ -307,6 +307,22 @@ def sync_alpaca_positions():
         if updated:
             _ledger.save_ledger(trades)
             log.info(f"Alpaca sync: updated {updated} closed position(s) in ledger")
+
+        # ── Auto-reconcile drift: close broker positions the ledger has
+        # already booked as exited. The ledger's simulated exits and the
+        # broker's trailing-stop exits are different engines; when the
+        # simulation closes first, the real position lingers and consumes
+        # buying power invisibly (this froze the account on 2026-07-08).
+        try:
+            ledger_open = {t.symbol.replace("/", "") for t in _ledger.open_positions()}
+            for p in client.get_all_positions():
+                sym = str(p.symbol)
+                if sym not in ledger_open:
+                    client.close_position(sym)
+                    log.info(f"Reconcile: closed orphan broker position {sym} "
+                             f"(ledger already exited it)")
+        except Exception as e:
+            log.warning(f"Orphan reconcile failed: {e}")
     except Exception as e:
         log.warning(f"Alpaca position sync failed: {e}")
 
