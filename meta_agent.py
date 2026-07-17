@@ -191,6 +191,22 @@ class MetaAgent:
                 and s.get("raw_confidence", 0.0) >= MIN_SOLO_CONFIDENCE)
         ]
 
+        # Step 5a: symbols we already hold can't consume top-N slots — the
+        # ensemble's dedup gate skips them anyway, so they'd burn the
+        # tick's entry budget on no-ops. (2026-07-17: held AAPL/AMD/GOOGL/
+        # META occupied the top slots every tick while an executable CVX
+        # oil-catalyst long sat at #5 and never traded.)
+        try:
+            import trade_ledger as _tl
+            held = {t.symbol for t in _tl.open_positions()}
+            before = len(passed)
+            passed = [s for s in passed if s["symbol"] not in held]
+            if len(passed) < before:
+                log.info(f"MetaAgent: excluded {before - len(passed)} signal(s) "
+                         f"on already-held symbols from entry slots")
+        except Exception:
+            pass
+
         # Step 5: Sort by confidence, take top N
         passed.sort(key=lambda x: x["confidence"], reverse=True)
         passed = passed[:MAX_SIGNALS_PER_TICK]
