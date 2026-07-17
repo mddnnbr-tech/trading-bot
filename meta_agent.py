@@ -57,8 +57,13 @@ MAX_SIGNALS_PER_TICK   = 2      # top-2 per tick; combined with the ensemble's
                                 # setups instead of all filling at the open
 MIN_AGENT_WEIGHT       = 0.40   # lowered from 0.65 — losing agents must actually
                                 # lose influence, or the weighting layer teaches nothing
-MIN_SOLO_CONFIDENCE    = 0.70   # a signal with only one agent behind it needs strong
-                                # standalone conviction; consensus signals pass normally
+MIN_SOLO_CONFIDENCE    = 0.65   # calibrated 2026-07-17: the catalyst specialists
+                                # (Intermarket/Volatility) scale 0.55-0.80 and only
+                                # exceed 0.70 on extreme moves — a +2.3% WTI day
+                                # scored 0.68 and was blocked by the old 0.70 bar,
+                                # which was never calibrated to their scale. 0.65
+                                # admits real catalyst signals; 0.62 technical
+                                # single-indicator noise stays blocked.
 PROFIT_WEIGHT_EXPONENT = 0.6    # power curve — top earners rewarded more
 REGIME_BOOST           = 0.25   # weight bonus for agents in their best regime
 MIN_TRADES_FOR_WEIGHTING = 20   # don't apply P&L weighting until we have real data
