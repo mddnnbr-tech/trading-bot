@@ -140,9 +140,18 @@ class MetaAgent:
                 log.info(f"MetaAgent: dropped solo short {s['symbol']} — "
                          f"shorts require 2+ agent consensus")
                 continue
-            if n_agents < 2 and s["confidence"] < MIN_SOLO_CONFIDENCE:
+            # Solo conviction is judged on the agent's RAW confidence, not
+            # the performance-weighted one. Judging post-weight created a
+            # death spiral for solo specialists (Intermarket/Volatility/
+            # Surge): a negative record crushed the weight, the weighted
+            # conf could never clear the bar, so the agent could never
+            # trade again to repair its record — WTI +2.7% on 2026-07-17
+            # fired textbook CVX/XOM signals every tick and all were
+            # dropped at 0.45-0.47 despite ~0.74 raw conviction.
+            raw_conf = s.get("raw_confidence", s["confidence"])
+            if n_agents < 2 and raw_conf < MIN_SOLO_CONFIDENCE:
                 log.info(f"MetaAgent: dropped solo {s['direction']} {s['symbol']} "
-                         f"(conf {s['confidence']:.2f} < {MIN_SOLO_CONFIDENCE} solo bar)")
+                         f"(raw conf {raw_conf:.2f} < {MIN_SOLO_CONFIDENCE} solo bar)")
                 continue
             kept.append(s)
         merged = kept
@@ -172,7 +181,15 @@ class MetaAgent:
         if merged:
             top = sorted(merged, key=lambda x: x["confidence"], reverse=True)[:5]
             log.info(f"MetaAgent top merged confs: {[(s['symbol'],s['direction'],round(s['confidence'],3)) for s in top]}")
-        passed = [s for s in merged if s["confidence"] >= CONSENSUS_THRESHOLD]
+        # Solo specialists that cleared the raw-conviction bar are exempt
+        # from the weighted threshold too — otherwise the weight floor
+        # re-blocks at this step what the solo bar just admitted.
+        passed = [
+            s for s in merged
+            if s["confidence"] >= CONSENSUS_THRESHOLD
+            or (s.get("agent_count", 1) == 1
+                and s.get("raw_confidence", 0.0) >= MIN_SOLO_CONFIDENCE)
+        ]
 
         # Step 5: Sort by confidence, take top N
         passed.sort(key=lambda x: x["confidence"], reverse=True)
@@ -216,7 +233,9 @@ class MetaAgent:
                 log.debug(f"MetaAgent: regime boost for {agent_name} in {agent_regimes & regimes}")
 
             new_conf = s["confidence"] * weight * conf_mult
-            enriched = {**s, "confidence": round(new_conf, 4), "original_agent": agent_name}
+            enriched = {**s, "confidence": round(new_conf, 4),
+                        "raw_confidence": s["confidence"],
+                        "original_agent": agent_name}
             result.append(enriched)
         return result
 
