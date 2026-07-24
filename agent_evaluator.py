@@ -168,7 +168,17 @@ class AgentEvaluator:
             opened = _trade_opened_dt(t)
             pnl    = _pnl_for_trade(t)
 
-            for agent in t.all_agents:
+            # Normalize to REAL agent names: the ledger stores primaries as
+            # "MetaAgent(NewsAgent, OptionsFlowAgent)" — benching that
+            # string never matches any actual agent, which silently
+            # no-op'd much of rotation until 2026-07-24.
+            _names = set()
+            for raw in t.all_agents:
+                for part in raw.replace("MetaAgent(", "").rstrip(")").split(","):
+                    part = part.strip()
+                    if part and part != "MetaAgent":
+                        _names.add(part)
+            for agent in _names:
                 d = agg.setdefault(agent, {
                     "pnl_5d":       0.0, "pnl_20d":      0.0, "pnl_alltime":  0.0,
                     "trades_5d":    0,   "trades_20d":   0,   "trades_total": 0,
