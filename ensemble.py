@@ -176,6 +176,22 @@ class Ensemble:
             return []
         entries_remaining = min(entries_remaining, MAX_OPEN_POSITIONS - open_count)
 
+        # Capital gate — the real constraint. Deploy freely while buying
+        # power exists; stand down just before the wall instead of firing
+        # doomed orders into $0 bp all day (2026-07-23: 597 failed
+        # submissions). Reserve = ~2 positions of headroom.
+        try:
+            from order_executor import get_executor
+            _client = get_executor()._client
+            if _client is not None:
+                bp = float(_client.get_account().buying_power)
+                if bp < 20_000:
+                    log.info(f"Buying power ${bp:,.0f} below reserve — "
+                             f"managing open positions only this tick")
+                    return []
+        except Exception:
+            pass
+
         # Step 2b: dynamic universe injection — the whole market via funnel.
         # Static watchlists cover ~40 core names; the market-wide screens
         # (gainers/losers/most-active) find whatever ELSE is moving today —
