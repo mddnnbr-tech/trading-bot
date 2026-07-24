@@ -45,6 +45,13 @@ ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "16000"))
 # which is exactly the bleed pattern the clean-epoch data convicted.
 DAILY_TRADE_CAP = int(os.getenv("DAILY_TRADE_CAP", "4"))
 
+# Max concurrent open equity positions. The daily cap limits FLOW but not
+# STOCK: trailing exits let positions ride for days, so 8/day quietly
+# stacked 25 open positions by 2026-07-23 and buying power hit ~$0 —
+# every new order (incl. shorts, which need margin headroom) bounced all
+# day. Portfolio must stay concentrated: new entries wait for exits.
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "10"))
+
 AGENT_SUMMARY_PATH = Path(__file__).resolve().parent / "logs" / "agent_summary.json"
 
 # ── Start Alpaca streaming at import time ─────────────────────────────────────
@@ -159,6 +166,15 @@ class Ensemble:
             log.info(f"Daily trade cap reached ({opened_today}/{DAILY_TRADE_CAP}) "
                      f"— managing open positions only, no new entries today")
             return []
+        try:
+            open_count = len([t for t in _tl.open_positions() if "/" not in t.symbol])
+        except Exception:
+            open_count = 0
+        if open_count >= MAX_OPEN_POSITIONS:
+            log.info(f"Max open positions reached ({open_count}/{MAX_OPEN_POSITIONS}) "
+                     f"— waiting for exits before new entries")
+            return []
+        entries_remaining = min(entries_remaining, MAX_OPEN_POSITIONS - open_count)
 
         # Step 2b: dynamic universe injection — the whole market via funnel.
         # Static watchlists cover ~40 core names; the market-wide screens
