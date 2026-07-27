@@ -328,6 +328,16 @@ def sync_alpaca_positions():
                             client.cancel_order_by_id(o.id)
                     except Exception:
                         pass
+                    # Only liquidate LOSERS. A profitable "orphan" means the
+                    # ledger's price simulation closed early while the
+                    # broker's trailing stop is still riding a winner —
+                    # killing those forfeits exactly the runners the whole
+                    # asymmetry design exists to capture (2026-07-27:
+                    # GPC +$1,060, NFLX +$877 were orphans).
+                    if float(p.unrealized_pl) > 0:
+                        log.info(f"Reconcile: KEEPING winning orphan {sym} "
+                                 f"(+${float(p.unrealized_pl):.0f}) — trailing stop still active")
+                        continue
                     client.close_position(sym)
                     log.info(f"Reconcile: closed orphan broker position {sym} "
                              f"(ledger already exited it)")
