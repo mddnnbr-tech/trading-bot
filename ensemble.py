@@ -265,6 +265,10 @@ class Ensemble:
                 # ATR-derived levels give volatile names room to breathe
                 # and quiet names tighter, reachable targets.
                 signal = self._normalize_geometry(signal)
+                if signal.get("_falling_knife"):
+                    log.info(f"🔪 SKIPPED: {signal['symbol']:6} long — falling knife "
+                             f"({signal['_falling_knife']}); gap risk exceeds trail protection")
+                    continue
                 # Dedup gate: one open position per symbol, either side.
                 # Same-side re-entry caused the duplicate-position pileup;
                 # opposite-side entry fails anyway at Alpaca ("bracket orders
@@ -425,6 +429,17 @@ class Ensemble:
             entry = float(signal.get("entry_price") or 0)
             if atr <= 0 or entry <= 0:
                 return signal
+
+            # Falling-knife guard: never buy a LONG into a multi-day
+            # collapse. Trailing stops cannot protect against overnight
+            # gaps — AMKR was bought long 2026-07-27 mid-collapse (-8.6%
+            # the prior day), gapped -14.5% overnight, and lost $1,170 on
+            # a 6% trail: 4x the intended per-trade risk. A stock in
+            # freefall is a SHORT candidate, not a long one.
+            if signal.get("direction") == "long" and len(df) >= 3:
+                two_day = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-3]) - 1) * 100
+                if two_day <= -8.0:
+                    signal["_falling_knife"] = f"{two_day:.1f}% over 2 days"
             stop_dist = max(1.5 * atr, entry * 0.01)
             # target_price is a distant bookkeeping marker (4x stop) — the
             # real exit is the broker-side trailing stop, which is uncapped
