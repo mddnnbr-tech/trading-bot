@@ -1112,6 +1112,160 @@ class DailyReporter:
 
     # ── v2.2 ledger-backed sections ──────────────────────────────────────────
 
+    def _format_intelligence_section(self, d: dict) -> str:
+        """The five metrics that actually predict whether this compounds:
+        benchmark-relative return, long/short split, per-agent trend,
+        capital efficiency, and expectancy. Added 2026-07-28 — the old
+        report gave totals with no attribution or direction."""
+        if not _LEDGER_AVAILABLE:
+            return '<p style="color:#94a3b8">Ledger unavailable.</p>'
+        try:
+            from collections import defaultdict
+            trades = _ledger.epoch_trades()
+            closed = [t for t in trades if not t.is_open]
+            opens  = [t for t in trades if t.is_open]
+        except Exception as e:
+            return f'<p style="color:#94a3b8">Intelligence unavailable: {e}</p>'
+
+        def _pnl(t):
+            return (t.realized_pnl if not t.is_open else t.unrealized_pnl) or 0.0
+
+        def _clr(v):
+            return "#22c55e" if v >= 0 else "#ef4444"
+
+        # ── 1. Benchmark: bot vs SPY over matching windows ────────────
+        bench_rows = ""
+        try:
+            bal = float(os.getenv("ACCOUNT_BALANCE", "100000"))
+            spy = yf.Ticker("SPY").history(period="1mo", interval="1d")
+            today = _today_et()
+            for label, days in (("5-day", 5), ("10-day", 10), ("20-day", 20)):
+                cut = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+                win = [t for t in closed if (t.exit_at_et or t.opened_at_et)[:10] >= cut]
+                bot_pnl = sum(_pnl(t) for t in win)
+                bot_pct = bot_pnl / bal * 100
+                bars = min(days, len(spy) - 1)
+                spy_pct = ((float(spy["Close"].iloc[-1]) / float(spy["Close"].iloc[-1 - bars]) - 1) * 100
+                           if bars > 0 else 0.0)
+                edge = bot_pct - spy_pct
+                bench_rows += (
+                    f'<tr><td style="padding:6px 10px">{label}</td>'
+                    f'<td style="padding:6px 10px;text-align:right;color:{_clr(bot_pnl)};font-weight:700">'
+                    f'{bot_pnl:+,.0f} ({bot_pct:+.2f}%)</td>'
+                    f'<td style="padding:6px 10px;text-align:right;color:{_clr(spy_pct)}">{spy_pct:+.2f}%</td>'
+                    f'<td style="padding:6px 10px;text-align:right;color:{_clr(edge)};font-weight:700">'
+                    f'{edge:+.2f}%</td></tr>')
+        except Exception:
+            bench_rows = '<tr><td colspan="4" style="padding:6px 10px;color:#94a3b8">benchmark unavailable</td></tr>'
+
+        # ── 2. Long vs short: are we trading both sides? ──────────────
+        side_rows = ""
+        for side in ("LONG", "SHORT"):
+            sc = [t for t in closed if t.side == side]
+            so = [t for t in opens if t.side == side]
+            n, w = len(sc), sum(1 for t in sc if _pnl(t) > 0)
+            p = sum(_pnl(t) for t in sc)
+            side_rows += (
+                f'<tr><td style="padding:6px 10px;font-weight:600">{side}</td>'
+                f'<td style="padding:6px 10px;text-align:right">{n}</td>'
+                f'<td style="padding:6px 10px;text-align:right">{len(so)}</td>'
+                f'<td style="padding:6px 10px;text-align:right">{(w/n*100) if n else 0:.0f}%</td>'
+                f'<td style="padding:6px 10px;text-align:right;color:{_clr(p)};font-weight:700">'
+                f'${p:+,.2f}</td></tr>')
+
+        # ── 3+4. Per-agent: trend, capital deployed, return on capital ─
+        ag = defaultdict(lambda: {"pnl": [], "cap": 0.0, "open": 0.0})
+        for t in trades:
+            name = t.primary_agent.replace("MetaAgent(", "").rstrip(")").split(",")[0].strip()
+            ag[name]["cap"] += (t.entry_price or 0) * (t.shares or 0)
+            if t.is_open:
+                ag[name]["open"] += _pnl(t)
+            else:
+                ag[name]["pnl"].append((t.exit_at_et or t.opened_at_et, _pnl(t)))
+
+        agent_rows = ""
+        for name, dd in sorted(ag.items(),
+                               key=lambda x: -(sum(p for _, p in x[1]["pnl"]) + x[1]["open"])):
+            seq = [p for _, p in sorted(dd["pnl"])]
+            tot = sum(seq) + dd["open"]
+            n = len(seq)
+            recent, prior = seq[-5:], seq[-10:-5]
+            if len(recent) >= 3 and prior:
+                ra, pa = sum(recent) / len(recent), sum(prior) / len(prior)
+                trend = ("📈 improving", "#22c55e") if ra > pa else ("📉 decaying", "#ef4444")
+            else:
+                trend = ("— new", "#94a3b8")
+            roc = (tot / dd["cap"] * 100) if dd["cap"] else 0.0
+            wr = (sum(1 for p in seq if p > 0) / n * 100) if n else 0
+            agent_rows += (
+                f'<tr><td style="padding:6px 10px;font-weight:600;font-size:12px">{name}</td>'
+                f'<td style="padding:6px 10px;text-align:right">{n}</td>'
+                f'<td style="padding:6px 10px;text-align:right">{wr:.0f}%</td>'
+                f'<td style="padding:6px 10px;text-align:right;color:{_clr(tot)};font-weight:700">${tot:+,.0f}</td>'
+                f'<td style="padding:6px 10px;text-align:right;font-size:11px">${dd["cap"]:,.0f}</td>'
+                f'<td style="padding:6px 10px;text-align:right;color:{_clr(roc)};font-weight:600">{roc:+.1f}%</td>'
+                f'<td style="padding:6px 10px;font-size:11px;color:{trend[1]}">{trend[0]}</td></tr>')
+
+        # ── 5. Expectancy — the number that predicts compounding ──────
+        wins = [_pnl(t) for t in closed if _pnl(t) > 0]
+        loss = [_pnl(t) for t in closed if _pnl(t) <= 0]
+        aw = sum(wins) / len(wins) if wins else 0
+        al = abs(sum(loss) / len(loss)) if loss else 0
+        wr = len(wins) / len(closed) if closed else 0
+        exp = (wr * aw) - ((1 - wr) * al)
+        be = (al / (aw + al) * 100) if (aw + al) else 0
+        verdict = ("POSITIVE — system compounds at this geometry", "#22c55e") if exp > 0 else \
+                  ("NEGATIVE — more volume means more loss", "#ef4444")
+
+        return f"""
+    <div class="section-title">🎯 Bot vs. Market (the only score that matters)</div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="background:#1e293b;color:#fff">
+        <th style="padding:7px 10px;text-align:left">Window</th>
+        <th style="padding:7px 10px;text-align:right">Bot</th>
+        <th style="padding:7px 10px;text-align:right">SPY</th>
+        <th style="padding:7px 10px;text-align:right">Edge</th>
+      </tr></thead><tbody>{bench_rows}</tbody></table>
+
+    <div class="section-title">⚖️ Long vs Short — are we trading both sides?</div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="background:#1e293b;color:#fff">
+        <th style="padding:7px 10px;text-align:left">Side</th>
+        <th style="padding:7px 10px;text-align:right">Closed</th>
+        <th style="padding:7px 10px;text-align:right">Open</th>
+        <th style="padding:7px 10px;text-align:right">Win%</th>
+        <th style="padding:7px 10px;text-align:right">P&amp;L</th>
+      </tr></thead><tbody>{side_rows}</tbody></table>
+
+    <div class="section-title">🤖 Agent Trend &amp; Capital Efficiency</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead><tr style="background:#1e293b;color:#fff">
+        <th style="padding:7px 10px;text-align:left">Agent</th>
+        <th style="padding:7px 10px;text-align:right">Trades</th>
+        <th style="padding:7px 10px;text-align:right">Win%</th>
+        <th style="padding:7px 10px;text-align:right">P&amp;L</th>
+        <th style="padding:7px 10px;text-align:right">Capital</th>
+        <th style="padding:7px 10px;text-align:right">Return</th>
+        <th style="padding:7px 10px;text-align:left">Trend</th>
+      </tr></thead><tbody>{agent_rows}</tbody></table>
+    <p style="font-size:11px;color:#94a3b8;margin:6px 0 0">
+      Return = P&amp;L ÷ capital deployed. Trend compares last 5 closed trades to the 5 before.
+      MetaAgent weights capital toward agents with positive P&amp;L; losers fall to the 0.40 floor.</p>
+
+    <div class="section-title">📐 Expectancy</div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px"><tbody>
+      <tr><td style="padding:6px 10px">Avg win</td>
+          <td style="padding:6px 10px;text-align:right;color:#22c55e;font-weight:700">${aw:,.2f}</td></tr>
+      <tr><td style="padding:6px 10px">Avg loss</td>
+          <td style="padding:6px 10px;text-align:right;color:#ef4444;font-weight:700">${al:,.2f}</td></tr>
+      <tr><td style="padding:6px 10px">Win rate / breakeven needed</td>
+          <td style="padding:6px 10px;text-align:right;font-weight:700">{wr*100:.0f}% / {be:.0f}%</td></tr>
+      <tr style="background:#f1f5f9"><td style="padding:8px 10px;font-weight:700">Expectancy per trade</td>
+          <td style="padding:8px 10px;text-align:right;color:{verdict[1]};font-weight:700">${exp:+,.2f}</td></tr>
+    </tbody></table>
+    <p style="font-size:12px;color:{verdict[1]};margin:6px 0 0;font-weight:600">{verdict[0]}</p>
+"""
+
     def _format_daily_trends_section(self, d: dict) -> str:
         """Today vs. yesterday vs. trailing 5-day average."""
         series = d.get("daily_series") or []
@@ -1492,6 +1646,8 @@ class DailyReporter:
 
     <div class="section-title">🔍 What I Noticed Today</div>
     {findings_html}
+
+    {self._format_intelligence_section(d)}
 
     <div class="section-title">💰 Performance Tracking — Paper vs. Live</div>
     {perf_html}
