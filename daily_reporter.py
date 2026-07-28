@@ -1197,11 +1197,18 @@ class DailyReporter:
                 trend = ("— new", "#94a3b8")
             roc = (tot / dd["cap"] * 100) if dd["cap"] else 0.0
             wr = (sum(1 for p in seq if p > 0) / n * 100) if n else 0
+            # 5-day average: mean P&L per closed trade over the trailing
+            # 5 calendar days — shows current form, not lifetime average.
+            _cut5 = (_today_et() - timedelta(days=5)).strftime("%Y-%m-%d")
+            _r5 = [p for ts, p in dd["pnl"] if (ts or "")[:10] >= _cut5]
+            avg5 = (sum(_r5) / len(_r5)) if _r5 else 0.0
+            avg5_txt = f"${avg5:+,.0f}" if _r5 else "—"
             agent_rows += (
                 f'<tr><td style="padding:6px 10px;font-weight:600;font-size:12px">{name}</td>'
                 f'<td style="padding:6px 10px;text-align:right">{n}</td>'
                 f'<td style="padding:6px 10px;text-align:right">{wr:.0f}%</td>'
                 f'<td style="padding:6px 10px;text-align:right;color:{_clr(tot)};font-weight:700">${tot:+,.0f}</td>'
+                f'<td style="padding:6px 10px;text-align:right;color:{_clr(avg5)};font-size:12px">{avg5_txt}</td>'
                 f'<td style="padding:6px 10px;text-align:right;font-size:11px">${dd["cap"]:,.0f}</td>'
                 f'<td style="padding:6px 10px;text-align:right;color:{_clr(roc)};font-weight:600">{roc:+.1f}%</td>'
                 f'<td style="padding:6px 10px;font-size:11px;color:{trend[1]}">{trend[0]}</td></tr>')
@@ -1243,8 +1250,9 @@ class DailyReporter:
         <th style="padding:7px 10px;text-align:left">Agent</th>
         <th style="padding:7px 10px;text-align:right">Trades</th>
         <th style="padding:7px 10px;text-align:right">Win%</th>
-        <th style="padding:7px 10px;text-align:right">P&amp;L</th>
-        <th style="padding:7px 10px;text-align:right">Capital</th>
+        <th style="padding:7px 10px;text-align:right">Total P&amp;L</th>
+        <th style="padding:7px 10px;text-align:right">5d Avg</th>
+        <th style="padding:7px 10px;text-align:right">Allocated</th>
         <th style="padding:7px 10px;text-align:right">Return</th>
         <th style="padding:7px 10px;text-align:left">Trend</th>
       </tr></thead><tbody>{agent_rows}</tbody></table>
