@@ -142,6 +142,20 @@ class MetaAgent:
         # a signal passes only with 2+ agreeing agents, OR a single agent
         # at >= MIN_SOLO_CONFIDENCE conviction. Shorts stay stricter —
         # always 2+ agents (solo shorts have lost in every era).
+        # Regime-linked gates. RegimeDetector labelled every tick and
+        # NOTHING acted on it — the audit's clearest contradiction. In a
+        # BEAR_TREND / HIGH_VOL tape the short gate relaxes (solo shorts
+        # allowed at the normal solo bar) and the long gate tightens; in a
+        # bull tape the original asymmetry stands, because it was correct
+        # for 107 of the last 123 sessions. 2026-07-29 proved the cost of
+        # applying bull-market rules on a -1000pt day.
+        _bear = bool(active_regs & {"BEAR_TREND", "HIGH_VOL"})
+        _short_solo_bar = MIN_SOLO_CONFIDENCE if _bear else SOLO_SHORT_CONFIDENCE
+        _long_solo_bar  = (MIN_SOLO_CONFIDENCE + 0.08) if _bear else MIN_SOLO_CONFIDENCE
+        if _bear:
+            log.info(f"MetaAgent: BEAR/HIGH_VOL regime — short bar eased to "
+                     f"{_short_solo_bar}, long bar raised to {round(_long_solo_bar,2)}")
+
         kept = []
         for s in merged:
             n_agents = s.get("agent_count", 1)
@@ -153,7 +167,7 @@ class MetaAgent:
                 # movers scale) is a different animal from the solo technical
                 # shorts that lost money in an up tape; those stay blocked.
                 _raw = s.get("raw_confidence", s["confidence"])
-                if _raw >= SOLO_SHORT_CONFIDENCE:
+                if _raw >= _short_solo_bar:
                     log.info(f"MetaAgent: solo short {s['symbol']} admitted via "
                              f"crash exception (raw conf {_raw:.2f})")
                 else:
@@ -170,9 +184,10 @@ class MetaAgent:
             # fired textbook CVX/XOM signals every tick and all were
             # dropped at 0.45-0.47 despite ~0.74 raw conviction.
             raw_conf = s.get("raw_confidence", s["confidence"])
-            if n_agents < 2 and raw_conf < MIN_SOLO_CONFIDENCE:
+            _bar = _long_solo_bar if s["direction"] == "long" else _short_solo_bar
+            if n_agents < 2 and raw_conf < _bar:
                 log.info(f"MetaAgent: dropped solo {s['direction']} {s['symbol']} "
-                         f"(raw conf {raw_conf:.2f} < {MIN_SOLO_CONFIDENCE} solo bar)")
+                         f"(raw conf {raw_conf:.2f} < {round(_bar,2)} solo bar)")
                 continue
             kept.append(s)
         merged = kept

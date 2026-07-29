@@ -149,6 +149,10 @@ class Ensemble:
         risk_status = self.risk.assess()
         if risk_status["halt_trading"]:
             log.warning(f"TRADING HALTED: {risk_status['warnings']}")
+            # A halt that only blocks new entries is not risk management —
+            # on 2026-07-29 it would have frozen the book fully long while
+            # the market fell another 1%. Cut the losers on the way out.
+            self._derisk_on_halt()
             return []
 
         # Step 2a: daily entry budget — once DAILY_TRADE_CAP equity positions
@@ -362,6 +366,55 @@ class Ensemble:
                 "timestamp":       datetime.now(timezone.utc).isoformat(),
             })
         return signals
+
+    _derisked_on: str = ""      # ET date the halt de-risk already ran
+
+    def _derisk_on_halt(self) -> None:
+        """Liquidate losing positions when the daily loss limit trips.
+
+        Winners keep their trailing stops — they're the asymmetry engine
+        and may be the hedge that's actually working. Losers are cut so a
+        bad day can't compound into a catastrophic one. Runs once per day.
+        """
+        from datetime import datetime as _dt
+        try:
+            import trade_ledger as _tl
+            today = _dt.now(_tl.ET).strftime("%Y-%m-%d")
+        except Exception:
+            today = "unknown"
+        if Ensemble._derisked_on == today:
+            return
+        Ensemble._derisked_on = today
+
+        try:
+            from order_executor import get_executor
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            import time as _t
+            client = get_executor()._client
+            if client is None:
+                return
+            cut, kept = [], []
+            for p in client.get_all_positions():
+                sym, pl = str(p.symbol), float(p.unrealized_pl)
+                if sym.endswith("USD") and len(sym) > 5:
+                    continue                      # crypto: own scheduler
+                if pl >= 0:
+                    kept.append(sym)
+                    continue
+                try:
+                    for o in client.get_orders(GetOrdersRequest(
+                            status=QueryOrderStatus.OPEN, symbols=[sym])):
+                        client.cancel_order_by_id(o.id)
+                    _t.sleep(0.4)
+                    client.close_position(sym)
+                    cut.append(f"{sym}({pl:+.0f})")
+                except Exception as e:
+                    log.warning(f"de-risk: could not close {sym}: {e}")
+            log.warning(f"🛑 DE-RISK on halt — cut losers: {', '.join(cut) or 'none'} "
+                        f"| winners left riding: {', '.join(kept) or 'none'}")
+        except Exception as e:
+            log.error(f"de-risk failed: {e}", exc_info=True)
 
     _universe_cache: tuple[float, list[str]] = (0.0, [])
 
