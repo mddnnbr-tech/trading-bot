@@ -100,7 +100,15 @@ AGENT_VARIANTS: dict[str, list[str]] = {
 # NOTE (v1.1): TechnicalAgent was removed — its 9% win rate didn't justify
 # protection. NewsAgent and SentimentAgent stay protected because their
 # signals feed multiple downstream evaluators beyond P&L attribution.
-PROTECTED_AGENTS = {"NewsAgent", "SentimentAgent"}
+# Short specialists are PROTECTED. On 2026-07-29 the market fell ~1000pts
+# and the book was 100% long with zero shorts — because rotation had
+# benched BearishPatternAgent AND ShortMomentumAgent on P&L earned under
+# the old broken geometry. Benching every short-capable agent also makes
+# the 2-agent short-consensus rule unsatisfiable, so the ensemble becomes
+# structurally long-only exactly when downside protection matters most.
+# Weight them down if they underperform; never bench them to zero.
+PROTECTED_AGENTS = {"NewsAgent", "SentimentAgent",
+                    "BearishPatternAgent", "ShortMomentumAgent"}
 
 
 class AgentRotator:

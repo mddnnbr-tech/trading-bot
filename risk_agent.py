@@ -175,6 +175,28 @@ class RiskAgent:
         consecutive-loss throttle silently never fired. trade_ledger is the
         single source of truth everywhere else in the system; use it here too.
         """
+        # BROKER EQUITY IS TRUTH for the daily circuit breaker. The ledger
+        # only tracks trades it knows about; drift (orphan positions the
+        # broker still holds) is invisible to it. On 2026-07-29 the market
+        # fell ~1000pts, real equity dropped -$5,557 (-5.6%), but the
+        # ledger showed +$2,106 — so the 3% daily-loss halt never fired
+        # and the bot kept adding long risk into a crash. Never again:
+        # ask the broker first, fall back to the ledger only if it errors.
+        self.daily_pnl = None
+        try:
+            from order_executor import get_executor
+            _c = get_executor()._client
+            if _c is not None:
+                _a = _c.get_account()
+                _eq, _last = float(_a.equity), float(_a.last_equity)
+                if _last > 0:
+                    self.daily_pnl = _eq - _last
+                    self.account_balance = _eq
+                    log.info(f"RiskAgent: broker equity ${_eq:,.0f} "
+                             f"(day {self.daily_pnl:+,.0f})")
+        except Exception as e:
+            log.warning(f"RiskAgent: broker equity unavailable ({e}) — using ledger")
+
         try:
             import trade_ledger as _ledger
             from datetime import timedelta
@@ -189,7 +211,9 @@ class RiskAgent:
             trades_today = [t for t in all_trades if t.opened_at_et[:10] == today_str]
             trades_week  = [t for t in all_trades if t.opened_at_et[:10] >= week_cut]
 
-            self.daily_pnl  = sum(pnl(t) for t in trades_today)
+            # Only fall back to ledger P&L if the broker call failed above.
+            if self.daily_pnl is None:
+                self.daily_pnl = sum(pnl(t) for t in trades_today)
             self.weekly_pnl = sum(pnl(t) for t in trades_week)
 
             # Count consecutive losses from most recent CLOSED trades backward
@@ -206,7 +230,8 @@ class RiskAgent:
 
         except Exception as e:
             log.warning(f"Could not load performance data: {e}")
-            self.daily_pnl          = 0.0
+            if self.daily_pnl is None:
+                self.daily_pnl = 0.0
             self.weekly_pnl         = 0.0
             self.consecutive_losses = 0
 
