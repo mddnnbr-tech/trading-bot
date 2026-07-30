@@ -145,6 +145,14 @@ class Ensemble:
             log.warning(f"RegimeDetector failed: {e} — NEUTRAL")
             regimes = {"NEUTRAL"}
 
+        # Step 1b: manage open option exits every tick — options have no
+        # broker-side trailing stop, so profit/stop/theta rules run here.
+        try:
+            from options_executor import manage_options_exits
+            manage_options_exits()
+        except Exception as _me:
+            log.debug(f"options exit manager: {_me}")
+
         # Step 2: risk gate
         risk_status = self.risk.assess()
         if risk_status["halt_trading"]:
@@ -299,8 +307,19 @@ class Ensemble:
                         f"conf={signal['confidence']:.2f} tier={result.get('account_tier', '?')}"
                     )
                     approved.append(result)
-                    from order_executor import execute_signal
-                    execute_signal(result)
+                    # High-conviction signals route to OPTIONS (defined
+                    # risk: max loss = premium). Everything else, and any
+                    # option that can't find a liquid contract, falls back
+                    # to shares.
+                    opt = None
+                    try:
+                        from options_executor import execute_options_trade
+                        opt = execute_options_trade(result)
+                    except Exception as _oe:
+                        log.warning(f"options route failed: {_oe}")
+                    if opt is None:
+                        from order_executor import execute_signal
+                        execute_signal(result)
                 else:
                     log.info(
                         f"⛔ REJECTED: {signal['symbol']:6} — "
