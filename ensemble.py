@@ -52,6 +52,11 @@ DAILY_TRADE_CAP = int(os.getenv("DAILY_TRADE_CAP", "4"))
 # day. Portfolio must stay concentrated: new entries wait for exits.
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "10"))
 
+# Hard cap on the learner's blacklist. Guards against the failure found
+# 2026-07-30: a learner trained on corrupted-era data blacklisted 40
+# symbols (the entire universe) and would have stopped the bot trading.
+MAX_AVOID_SYMBOLS = int(os.getenv("MAX_AVOID_SYMBOLS", "8"))
+
 AGENT_SUMMARY_PATH = Path(__file__).resolve().parent / "logs" / "agent_summary.json"
 
 # ── Start Alpaca streaming at import time ─────────────────────────────────────
@@ -411,23 +416,31 @@ class Ensemble:
         ts, cached = cls._avoid_cache
         if time.time() - ts < 600:
             return cached
-        out = set()
-        for p in (Path(__file__).resolve().parent / "logs" / "learned_params.json",
-                  Path(__file__).resolve().parent / "data" / "learned_params.json"):
-            try:
-                if not p.exists():
+        # Rank by REALIZED DAMAGE in the clean epoch, not by the learner's
+        # raw avoid-list. That list was computed over 4,213 pre-epoch
+        # trades from the corrupted era and named 40 symbols — AAPL, MSFT,
+        # NVDA, GOOGL, QQQ, essentially the whole universe — because during
+        # that period everything lost to bugs, not to the symbols. Trusting
+        # it verbatim would have halted trading. Blacklist only the worst
+        # few, and only on evidence from trustworthy data.
+        out: set = set()
+        try:
+            import trade_ledger as _tl
+            from collections import defaultdict
+            dmg = defaultdict(lambda: [0.0, 0, 0])   # pnl, trades, wins
+            for t in _tl.epoch_trades():
+                if t.is_open:
                     continue
-                data = json.loads(p.read_text()) or {}
-                for _agent, info in (data.get("agent_params") or {}).items():
-                    out.update((info.get("adjustments") or {}).get("avoid_symbols") or [])
-                for sym, st in (data.get("symbol_stats") or {}).items():
-                    if isinstance(st, dict) and st.get("win_rate", 1) < 0.30 \
-                            and st.get("trades", 0) >= 5:
-                        out.add(sym)
-                break
-            except Exception as e:
-                log.debug(f"learned_params read failed: {e}")
-        out = set(list(out)[:40])
+                p = t.realized_pnl or 0.0
+                d = dmg[t.symbol]
+                d[0] += p; d[1] += 1; d[2] += (p > 0)
+            ranked = sorted(
+                (s for s, d in dmg.items() if d[1] >= 4 and d[0] < 0
+                 and (d[2] / d[1]) < 0.35),
+                key=lambda s: dmg[s][0])
+            out = set(ranked[:MAX_AVOID_SYMBOLS])
+        except Exception as e:
+            log.debug(f"avoid-list computation failed: {e}")
         cls._avoid_cache = (time.time(), out)
         if out:
             log.info(f"🧠 Learner avoid-list active ({len(out)}): {', '.join(sorted(out))}")
