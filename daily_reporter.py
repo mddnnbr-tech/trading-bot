@@ -1133,30 +1133,52 @@ class DailyReporter:
         def _clr(v):
             return "#22c55e" if v >= 0 else "#ef4444"
 
-        # ── 1. Benchmark: bot vs SPY over matching windows ────────────
-        bench_rows = ""
+        # ── 1. Benchmark: BROKER EQUITY vs SPY ────────────────────────
+        # Uses Alpaca's portfolio-history equity curve, NOT ledger P&L.
+        # 2026-07-30: the ledger version reported "+$2,376 (+2.38%),
+        # beating SPY by 1.90%" for a 5-day window in which real equity
+        # fell $19,908 — the ledger cannot see orphan/drift positions, so
+        # it reported a win during the worst drawdown of the account.
+        # Broker equity is the only number that cannot lie.
+        bench_rows, equity_now, equity_start = "", None, 100000.0
         try:
-            bal = float(os.getenv("ACCOUNT_BALANCE", "100000"))
-            spy = yf.Ticker("SPY").history(period="1mo", interval="1d")
-            today = _today_et()
-            for label, days in (("5-day", 5), ("10-day", 10), ("20-day", 20)):
-                cut = (today - timedelta(days=days)).strftime("%Y-%m-%d")
-                win = [t for t in closed if (t.exit_at_et or t.opened_at_et)[:10] >= cut]
-                bot_pnl = sum(_pnl(t) for t in win)
-                bot_pct = bot_pnl / bal * 100
-                bars = min(days, len(spy) - 1)
-                spy_pct = ((float(spy["Close"].iloc[-1]) / float(spy["Close"].iloc[-1 - bars]) - 1) * 100
-                           if bars > 0 else 0.0)
+            import requests
+            hdr = {"APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY", ""),
+                   "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET", "")}
+            hist = requests.get(
+                "https://paper-api.alpaca.markets/v2/account/portfolio/history",
+                params={"period": "3M", "timeframe": "1D"}, headers=hdr, timeout=15).json()
+            eq = [e for e in (hist.get("equity") or []) if e]
+            spy = yf.Ticker("SPY").history(period="3mo", interval="1d")
+            equity_now = eq[-1] if eq else None
+            for label, days in (("1-day", 1), ("5-day", 5), ("20-day", 20), ("Since start", None)):
+                if days is None:
+                    prev, spy_bars = equity_start, len(spy) - 1
+                elif len(eq) > days:
+                    prev, spy_bars = eq[-1 - days], days
+                else:
+                    continue
+                chg = equity_now - prev
+                bot_pct = (equity_now / prev - 1) * 100 if prev else 0
+                spy_bars = min(spy_bars, len(spy) - 1)
+                spy_pct = ((float(spy["Close"].iloc[-1]) / float(spy["Close"].iloc[-1 - spy_bars]) - 1) * 100
+                           if spy_bars > 0 else 0.0)
                 edge = bot_pct - spy_pct
                 bench_rows += (
-                    f'<tr><td style="padding:6px 10px">{label}</td>'
-                    f'<td style="padding:6px 10px;text-align:right;color:{_clr(bot_pnl)};font-weight:700">'
-                    f'{bot_pnl:+,.0f} ({bot_pct:+.2f}%)</td>'
+                    f'<tr><td style="padding:6px 10px;font-weight:600">{label}</td>'
+                    f'<td style="padding:6px 10px;text-align:right;color:{_clr(chg)};font-weight:700">'
+                    f'${chg:+,.0f} ({bot_pct:+.2f}%)</td>'
                     f'<td style="padding:6px 10px;text-align:right;color:{_clr(spy_pct)}">{spy_pct:+.2f}%</td>'
                     f'<td style="padding:6px 10px;text-align:right;color:{_clr(edge)};font-weight:700">'
                     f'{edge:+.2f}%</td></tr>')
-        except Exception:
-            bench_rows = '<tr><td colspan="4" style="padding:6px 10px;color:#94a3b8">benchmark unavailable</td></tr>'
+        except Exception as e:
+            bench_rows = (f'<tr><td colspan="4" style="padding:6px 10px;color:#ef4444">'
+                          f'broker equity unavailable: {e}</td></tr>')
+        equity_hdr = (f'<div style="font-size:26px;font-weight:700;color:{_clr((equity_now or 0)-100000)}">'
+                      f'${equity_now:,.0f}</div>'
+                      f'<div style="font-size:12px;color:#64748b">account equity '
+                      f'({(equity_now/100000-1)*100:+.1f}% since $100k start)</div>'
+                      ) if equity_now else ""
 
         # ── 2. Long vs short: are we trading both sides? ──────────────
         side_rows = ""
@@ -1225,7 +1247,8 @@ class DailyReporter:
                   ("NEGATIVE — more volume means more loss", "#ef4444")
 
         return f"""
-    <div class="section-title">🎯 Bot vs. Market (the only score that matters)</div>
+    {equity_hdr}
+    <div class="section-title">🎯 Bot vs. Market — broker equity, not ledger</div>
     <table style="width:100%;border-collapse:collapse;font-size:13px">
       <thead><tr style="background:#1e293b;color:#fff">
         <th style="padding:7px 10px;text-align:left">Window</th>
@@ -1652,70 +1675,19 @@ class DailyReporter:
   </div>
   <div class="body">
 
-    <div class="section-title">🔍 What I Noticed Today</div>
-    {findings_html}
-
     {self._format_intelligence_section(d)}
-
-    <div class="section-title">💰 Performance Tracking — Paper vs. Live</div>
-    {perf_html}
-
-    {ledger_banner}
-
-    <div class="section-title">📈 Daily Trends</div>
-    {daily_trends_html}
-
-    <div class="section-title">🧮 Portfolio Since Inception</div>
-    {portfolio_html}
 
     <div class="section-title">📂 Currently Open Positions</div>
     {open_positions_html}
 
-    <div class="section-title">🤖 Per-Agent Evaluator</div>
-    {agent_eval_html}
-
-    <div class="kpi-row" style="margin-top:20px">
-      <div class="kpi">
-        <div class="val" style="color:{pnl_color}">{pnl_sign}${d['total_pnl']:,.2f}</div>
-        <div class="lbl">Closed P&amp;L</div>
-      </div>
-      <div class="kpi">
-        <div class="val">{signals_card}</div>
-        <div class="lbl">Signals (✓/✗)</div>
-      </div>
-      <div class="kpi">
-        <div class="val">{notional_card}</div>
-        <div class="lbl">Notional Approved</div>
-      </div>
-      <div class="kpi">
-        <div class="val">{d['closed_trades']}</div>
-        <div class="lbl">Closed Trades</div>
-      </div>
-      <div class="kpi">
-        <div class="val">{d['raw_signals_total']}</div>
-        <div class="lbl">Raw Signals Peak</div>
-      </div>
-    </div>
-
     <div class="section-title">✅ Today's Approved Trades</div>
     {approved_html}
 
-    <div class="section-title">🚫 Top Rejection Reasons</div>
-    {reject_html}
-
-    <div class="section-title">🤖 Agent Activity</div>
-    {agents_html}
-
-    <div class="section-title">📡 Fetch Errors (yfinance 404s)</div>
-    {err_html}
-
-    <div class="section-title">⏱  Tick Health</div>
-    {tick_html}
-
-    <div class="section-title">🧭 Running Totals</div>
+    <div class="section-title">⏱  System Health</div>
     <p style="font-size:13px;color:#475569;margin:0">
-      All-time paper P&amp;L: <strong>${d['all_time_pnl']:+,.2f}</strong>
-      across {d['all_time_trades']} closed trades.
+      Ticks: {sched['tick_count']:,} / ~390 &nbsp;•&nbsp; Errors: {sched['error_count']:,}
+      &nbsp;•&nbsp; Signals: {d['approved_count']}✓ / {d['rejected_count']}✗
+      &nbsp;•&nbsp; Last log: {sched['last_log'] or '—'}
     </p>
   </div>
   <div class="footer">
