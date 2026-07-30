@@ -276,6 +276,17 @@ class Ensemble:
                 # noise (20% win rate vs the 29% that geometry requires).
                 # ATR-derived levels give volatile names room to breathe
                 # and quiet names tighter, reachable targets.
+                # Apply what the weekly learner actually learned. Until
+                # 2026-07-30 strategy_learner wrote learned_params.json and
+                # NOTHING read it — it had flagged XLE/QQQ/META/AMD/XOM as
+                # persistent losers weeks ago while the bot kept trading
+                # them (META -$877, XLE -$31 in one prune). A learning loop
+                # whose output is never consumed is a diary, not learning.
+                if signal["symbol"] in self._avoid_symbols():
+                    log.info(f"🧠 SKIPPED: {signal['symbol']:6} {signal['direction']:5} "
+                             f"— on learner's avoid list (persistent loser)")
+                    continue
+
                 signal = self._normalize_geometry(signal)
                 if signal.get("_falling_knife"):
                     log.info(f"🔪 SKIPPED: {signal['symbol']:6} long — falling knife "
@@ -385,6 +396,42 @@ class Ensemble:
                 "timestamp":       datetime.now(timezone.utc).isoformat(),
             })
         return signals
+
+    _avoid_cache: tuple[float, set] = (0.0, set())
+
+    @classmethod
+    def _avoid_symbols(cls) -> set:
+        """Symbols the weekly learner flagged as persistent losers.
+
+        Refreshed every 10 minutes so a Friday learning run takes effect
+        without a restart. Capped at 40 so one bad week can't blacklist
+        the entire tradeable universe.
+        """
+        import time, json
+        ts, cached = cls._avoid_cache
+        if time.time() - ts < 600:
+            return cached
+        out = set()
+        for p in (Path(__file__).resolve().parent / "logs" / "learned_params.json",
+                  Path(__file__).resolve().parent / "data" / "learned_params.json"):
+            try:
+                if not p.exists():
+                    continue
+                data = json.loads(p.read_text()) or {}
+                for _agent, info in (data.get("agent_params") or {}).items():
+                    out.update((info.get("adjustments") or {}).get("avoid_symbols") or [])
+                for sym, st in (data.get("symbol_stats") or {}).items():
+                    if isinstance(st, dict) and st.get("win_rate", 1) < 0.30 \
+                            and st.get("trades", 0) >= 5:
+                        out.add(sym)
+                break
+            except Exception as e:
+                log.debug(f"learned_params read failed: {e}")
+        out = set(list(out)[:40])
+        cls._avoid_cache = (time.time(), out)
+        if out:
+            log.info(f"🧠 Learner avoid-list active ({len(out)}): {', '.join(sorted(out))}")
+        return out
 
     _derisked_on: str = ""      # ET date the halt de-risk already ran
 
