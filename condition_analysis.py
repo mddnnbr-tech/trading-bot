@@ -124,6 +124,79 @@ def _cut(c, expr: str, label: str) -> list[str]:
     return out + [""]
 
 
+# Evidence bar a finding must clear before it may be acted on. These are
+# the numbers, not a judgement call — added 2026-07-31 after I presented
+# two findings in one hour that were both weaker than claimed, in
+# opposite directions, because each was computed by fresh ad-hoc SQL
+# rather than one canonical path.
+ACT_MIN_N        = 20     # sample size
+ACT_MAX_CONC     = 50.0   # % of |P&L| from top 2 trades
+ACT_MIN_EDGE     = 60.0   # $ per-trade difference vs the comparison group
+
+
+def recommendations(c) -> list[dict]:
+    """Ranked verdicts with an explicit ACT / WATCH / INSUFFICIENT label.
+
+    Every candidate is measured the same way through one code path, so
+    two runs cannot disagree. Nothing here writes a parameter.
+    """
+    out = []
+
+    def _grp(expr, bucket):
+        r = c.execute(
+            f"SELECT COUNT(*), AVG(m.pnl), "
+            f"AVG(CASE WHEN m.pnl>0 THEN 1.0 ELSE 0 END)*100 "
+            f"FROM entries e JOIN postmortems m ON e.trade_key=m.trade_key "
+            f"WHERE {expr}", ()).fetchone()
+        return {"n": r[0] or 0, "avg": r[1] or 0.0, "wr": r[2] or 0.0,
+                "conc": _concentration_expr(c, expr)}
+
+    candidates = [
+        ("Hold winners past 2 days",
+         "m.days_held >= 5", "m.days_held BETWEEN 2 AND 4.99",
+         "widen trailing stop after day 2 so trades reach the 5d+ bucket"),
+        ("Require 2+ agent consensus",
+         "e.agent_count >= 2", "e.agent_count = 1",
+         "raise the solo bar / expand corroboration requirements"),
+        ("Avoid wide (4%+) ATR stops",
+         "e.atr_pct < 4", "e.atr_pct >= 4",
+         "cap ATR stop width or reduce size on high-ATR names"),
+        ("Favour shorts over longs",
+         "e.side = 'short'", "e.side = 'long'",
+         "relax short gates / tighten long gates"),
+        ("Favour the 9-10am open",
+         "e.hour_et < 10", "e.hour_et >= 10",
+         "concentrate entries in the first hour"),
+    ]
+
+    for label, a_expr, b_expr, action in candidates:
+        a, b = _grp(a_expr, None), _grp(b_expr, None)
+        edge = a["avg"] - b["avg"]
+        if a["n"] < ACT_MIN_N or b["n"] < ACT_MIN_N:
+            verdict, why = "INSUFFICIENT", f"need {ACT_MIN_N}+ per side (have {a['n']}/{b['n']})"
+        elif a["conc"] >= ACT_MAX_CONC:
+            verdict, why = "WATCH", f"top-2 trades are {a['conc']:.0f}% of the result"
+        elif abs(edge) < ACT_MIN_EDGE:
+            verdict, why = "WATCH", f"edge ${edge:+,.0f}/trade is below the ${ACT_MIN_EDGE:.0f} bar"
+        else:
+            verdict, why = "ACT", f"${edge:+,.0f}/trade edge on {a['n']} vs {b['n']} trades"
+        out.append({"finding": label, "verdict": verdict, "edge": edge,
+                    "n": a["n"], "wr": a["wr"], "conc": a["conc"],
+                    "why": why, "action": action})
+
+    order = {"ACT": 0, "WATCH": 1, "INSUFFICIENT": 2}
+    out.sort(key=lambda r: (order[r["verdict"]], -abs(r["edge"])))
+    return out
+
+
+def _concentration_expr(c, expr: str) -> float:
+    rows = [abs(r[0]) for r in c.execute(
+        f"SELECT m.pnl FROM entries e JOIN postmortems m ON e.trade_key=m.trade_key "
+        f"WHERE {expr} ORDER BY ABS(m.pnl) DESC").fetchall()]
+    tot = sum(rows)
+    return (sum(rows[:2]) / tot * 100) if tot else 0.0
+
+
 def analyze() -> str:
     trade_context.classify_closed_trades(limit=500)
     backfill_entries()
@@ -134,6 +207,15 @@ def analyze() -> str:
     L = ["# Condition → Outcome Analysis", "",
          f"_{joined} trades with both conditions and classified outcomes. "
          f"Buckets under {MIN_CELL} trades are suppressed as noise._", ""]
+
+    L += ["## VERDICTS — what the evidence supports", "",
+          "| finding | verdict | edge/trade | n | why | action if ACT |",
+          "|---|---|---:|---:|---|---|"]
+    for r in recommendations(c):
+        L.append(f"| {r['finding']} | **{r['verdict']}** | ${r['edge']:+,.0f} | "
+                 f"{r['n']} | {r['why']} | {r['action'] if r['verdict']=='ACT' else '—'} |")
+    L += ["", f"_ACT requires: {ACT_MIN_N}+ trades per side, top-2 concentration "
+              f"under {ACT_MAX_CONC:.0f}%, and a ${ACT_MIN_EDGE:.0f}+/trade edge._", ""]
 
     L += _cut(c, "e.agent_count", "Consensus — does agreement help?")
     L += _cut(c, "CASE WHEN e.hour_et < 10 THEN '1. open (9-10am)' "
