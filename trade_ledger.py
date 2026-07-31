@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import logging
 import os
 import re
 from collections import defaultdict
@@ -55,6 +56,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 ET = ZoneInfo("America/New_York")
+log = logging.getLogger("TradeLedger")
 
 # ── Tunables ─────────────────────────────────────────────────────────────────
 DEFAULT_RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "320"))  # $ per trade
@@ -341,6 +343,89 @@ def _pnl_for(trade: Trade, exit_price: float) -> float:
     return round(trade.shares * (exit_price - trade.entry_price) * sign, 2)
 
 
+def sync_from_broker() -> dict:
+    """Re-open ledger rows for positions the broker actually holds.
+
+    The broker-override in refresh_open_positions stops NEW orphans, but
+    rows already wrongly closed stay closed — the ledger keeps under-
+    reporting exposure and the reconcile warning never clears. This heals
+    the existing divergence: any equity position the broker holds that the
+    ledger shows closed is re-opened at its real broker cost basis, so
+    both systems describe the same book.
+
+    Deliberately one-directional: it re-opens what the broker holds and
+    never closes anything. Closing stays with the broker's own fills.
+    """
+    out = {"reopened": 0, "created": 0, "checked": 0}
+    try:
+        import os as _os, requests as _rq
+        h = {"APCA-API-KEY-ID": _os.getenv("ALPACA_API_KEY", ""),
+             "APCA-API-SECRET-KEY": _os.getenv("ALPACA_API_SECRET", "")}
+        r = _rq.get("https://paper-api.alpaca.markets/v2/positions", headers=h, timeout=15)
+        if r.status_code != 200:
+            return {**out, "error": f"HTTP {r.status_code}"}
+        positions = r.json()
+    except Exception as e:
+        return {**out, "error": str(e)}
+
+    trades = load_ledger()
+    live_open = {t.symbol.replace("/", "") for t in trades.values() if t.is_open}
+    now_iso = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
+
+    for p in positions:
+        sym = str(p.get("symbol", ""))
+        if len(sym) > 12:            # options tracked separately
+            continue
+        out["checked"] += 1
+        if sym in live_open:
+            continue
+
+        qty   = float(p.get("qty") or 0)
+        basis = float(p.get("avg_entry_price") or 0)
+        unrl  = float(p.get("unrealized_pl") or 0)
+        cur   = float(p.get("current_price") or 0)
+        side  = "LONG" if qty > 0 else "SHORT"
+        if basis <= 0 or qty == 0:
+            continue
+
+        # Prefer resurrecting the most recent closed row for this symbol
+        prior = sorted(
+            [t for t in trades.values()
+             if t.symbol.replace("/", "") == sym and t.side == side and not t.is_open],
+            key=lambda t: t.exit_at_et or t.opened_at_et, reverse=True)
+        if prior:
+            t = prior[0]
+            t.status = "open"
+            t.exit_price = None
+            t.exit_at_et = ""
+            t.exit_reason = ""
+            t.realized_pnl = 0.0
+            t.unrealized_pnl = unrl
+            t.current_price = cur
+            t.shares = abs(qty)
+            t.entry_price = basis
+            t.last_updated_et = now_iso
+            out["reopened"] += 1
+        else:
+            tid = _trade_id(now_iso, sym, side, basis)
+            trades[tid] = Trade(
+                trade_id=tid, opened_at_et=now_iso, symbol=sym, side=side,
+                primary_agent="BrokerSync", contributors="",
+                entry_price=basis,
+                target_price=basis * (1.08 if side == "LONG" else 0.92),
+                stop_price=basis * (0.96 if side == "LONG" else 1.04),
+                risk_dollar=abs(basis - basis * (0.96 if side == "LONG" else 1.04)) * abs(qty),
+                shares=abs(qty), status="open",
+                unrealized_pnl=unrl, current_price=cur, last_updated_et=now_iso)
+            out["created"] += 1
+
+    if out["reopened"] or out["created"]:
+        save_ledger(trades)
+        log.info(f"broker sync: re-opened {out['reopened']}, adopted {out['created']} "
+                 f"position(s) the ledger had lost track of")
+    return out
+
+
 def refresh_open_positions(max_symbols: int = 60) -> dict:
     """For every open trade, fetch price path, mark hits, update unrealized P&L.
     Returns summary dict for logging."""
@@ -348,6 +433,7 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
     if yf is None:
         return {"error": "yfinance not installed", "updated": 0}
 
+    sync_from_broker()          # heal divergence before evaluating exits
     trades = load_ledger()
     open_trades = [t for t in trades.values() if t.is_open]
     if not open_trades:
