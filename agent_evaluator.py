@@ -178,6 +178,7 @@ class AgentEvaluator:
                     part = part.strip()
                     if part and part != "MetaAgent":
                         _names.add(part)
+            _names.discard("BrokerSync")   # bookkeeping label, not an agent
             for agent in _names:
                 d = agg.setdefault(agent, {
                     "pnl_5d":       0.0, "pnl_20d":      0.0, "pnl_alltime":  0.0,
