@@ -243,6 +243,7 @@ class Ensemble:
         # consensus (incl. corroborated shorts) becomes possible on names
         # no static list ever contained.
         dynamic = self._dynamic_universe()
+        dynamic = list(dict.fromkeys(list(dynamic) + list(Ensemble._cross_pollinate)))
         if dynamic:
             for agent in self.agents:
                 wl = getattr(agent, "watchlist", None)
@@ -271,6 +272,23 @@ class Ensemble:
 
         if skipped:
             log.info(f"⏸  Benched agents skipped: {', '.join(skipped)}")
+
+        # CROSS-POLLINATION — the corroboration fix.
+        # Measured 2026-07-31: 23 of 68 blocked signals were on symbols NO
+        # other agent had in its watchlist (AXTI, VCYT, RDDT, AMBA...).
+        # NewsAgent finds them via RSS and MoversAgent via screens, but the
+        # technical agents never LOOKED at them — so "needs 2 agents" was
+        # unsatisfiable by construction, not by disagreement. Any symbol
+        # signalled this tick is added to every agent's watchlist so it
+        # gets a real second opinion next tick.
+        try:
+            signalled = {s.get("symbol") for s in all_raw_signals
+                         if s.get("symbol") and "/" not in s.get("symbol", "")}
+            if signalled:
+                Ensemble._cross_pollinate |= signalled
+                Ensemble._cross_pollinate = set(list(Ensemble._cross_pollinate)[-40:])
+        except Exception:
+            pass
 
         # Step 4: Alpaca surge scan — catch real-time moves
         surge_signals = self._scan_surges(risk_status)
@@ -524,6 +542,10 @@ class Ensemble:
                         f"| winners left riding: {', '.join(kept) or 'none'}")
         except Exception as e:
             log.error(f"de-risk failed: {e}", exc_info=True)
+
+    # Symbols any agent signalled recently — injected into every agent's
+    # watchlist so corroboration is possible rather than structurally denied.
+    _cross_pollinate: set = set()
 
     _universe_cache: tuple[float, list[str]] = (0.0, [])
 
