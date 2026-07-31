@@ -1169,13 +1169,29 @@ class DailyReporter:
                 params={"period": "3M", "timeframe": "1D"}, headers=hdr, timeout=15).json()
             eq = [e for e in (hist.get("equity") or []) if e]
             spy = yf.Ticker("SPY").history(period="3mo", interval="1d")
-            equity_now = eq[-1] if eq else None
+
+            # LIVE equity, not the history series. Alpaca only posts a
+            # daily history bar AFTER the session settles, so eq[-1] is
+            # always YESTERDAY. On 2026-07-31 that made the report show
+            # "+$4,209, equity $88,927" (Thursday's numbers) while the
+            # account was actually at $86,176 and down $2,750 — a $6,960
+            # error that reported a great day during a circuit-breaker halt.
+            acct = requests.get("https://paper-api.alpaca.markets/v2/account",
+                                headers=hdr, timeout=15).json()
+            equity_now = float(acct.get("equity") or 0)
+            prev_close = float(acct.get("last_equity") or 0)
+
             for label, days in (("1-day", 1), ("5-day", 5), ("20-day", 20), ("Since start", None)):
-                if days is None:
+                if days == 1:
+                    # today = live equity vs the broker's own prior close
+                    prev, spy_bars = prev_close, 1
+                elif days is None:
                     prev, spy_bars = equity_start, len(spy) - 1
-                elif len(eq) > days:
-                    prev, spy_bars = eq[-1 - days], days
+                elif len(eq) >= days:
+                    prev, spy_bars = eq[-days], days
                 else:
+                    continue
+                if not prev:
                     continue
                 chg = equity_now - prev
                 bot_pct = (equity_now / prev - 1) * 100 if prev else 0
