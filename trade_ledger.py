@@ -354,6 +354,37 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
         save_ledger(trades)  # touch file even if nothing open
         return {"checked": 0, "closed_target": 0, "closed_stop": 0, "expired": 0, "still_open": 0}
 
+    # ── BROKER IS TRUTH FOR POSITION STATE ────────────────────────────
+    # Root cause of the drift that has plagued this account: this
+    # function SIMULATED exits from yfinance bars while the broker held
+    # the real GTC trailing stops. Two engines deciding the same thing —
+    # the ledger would "close" a trade the broker still held, creating an
+    # orphan that consumed buying power invisibly. It froze the account
+    # twice ($0 buying power, 597 failed orders) and hid $19,908 of
+    # losses from the circuit breaker. Clearing orphans by hand never
+    # worked because the simulation immediately recreated them.
+    #
+    # Fix: ask the broker what it actually holds. A position the broker
+    # still has stays OPEN in the ledger no matter what the price path
+    # suggests. Only positions the broker has genuinely exited get
+    # closed here, and simulation is reserved for symbols the broker
+    # cannot answer for (crypto handled by its own scheduler, or an API
+    # outage — in which case we degrade to the old behaviour rather than
+    # freeze).
+    broker_open: set | None = None
+    try:
+        import os as _os, requests as _rq
+        _h = {"APCA-API-KEY-ID": _os.getenv("ALPACA_API_KEY", ""),
+              "APCA-API-SECRET-KEY": _os.getenv("ALPACA_API_SECRET", "")}
+        _r = _rq.get("https://paper-api.alpaca.markets/v2/positions",
+                     headers=_h, timeout=15)
+        if _r.status_code == 200:
+            broker_open = {p["symbol"] for p in _r.json()}
+    except Exception as _be:
+        log.warning(f"broker position check failed ({_be}) — "
+                    f"falling back to price simulation this run")
+        broker_open = None
+
     # Group by symbol so we minimize yfinance calls
     by_symbol: dict[str, list[Trade]] = defaultdict(list)
     for t in open_trades:
@@ -387,6 +418,15 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                 except Exception:
                     t_df = df
             status, exit_price, exit_at = _check_hits(t, t_df)
+
+            # Broker override: if the broker still holds this symbol, the
+            # trade is OPEN regardless of what the simulated price path
+            # says. This is the line that stops orphans being created.
+            if broker_open is not None and status:
+                if t.symbol.replace("/", "") in broker_open:
+                    log.debug(f"{t.symbol}: sim says {status} but broker still "
+                              f"holds it — keeping open (trail active)")
+                    status = None
 
             if status:
                 t.status        = status
