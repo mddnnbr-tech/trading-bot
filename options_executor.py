@@ -136,6 +136,24 @@ def execute_options_trade(signal: dict) -> dict | None:
         return None
 
     try:
+        # DEDUP — options trades never reach trade_ledger, so the
+        # ensemble's has_open_position() gate cannot see them. On
+        # 2026-07-30 that let WOLF puts stack to 4 contracts across two
+        # strikes (~$2,000 exposure on an $890 budget) and SOFI calls to
+        # 18. The -$2,150 "single" WOLF loss was really four stacked
+        # entries. Check the broker directly for any live option on this
+        # underlying before adding another.
+        try:
+            for _p in client.get_all_positions():
+                _s = str(_p.symbol)
+                if len(_s) > 12 and _s.startswith(symbol):
+                    log.info(f"options: {symbol} already has an open contract "
+                             f"({_s}) — skipping to prevent stacking")
+                    return {"status": "skipped_duplicate", "symbol": _s}
+        except Exception as _de:
+            log.warning(f"options dedup check failed, refusing entry: {_de}")
+            return {"status": "dedup_unavailable"}
+
         equity = float(client.get_account().equity)
         opt_bp = float(getattr(client.get_account(), "options_buying_power", 0) or 0)
         entry  = float(signal.get("entry_price") or 0)
