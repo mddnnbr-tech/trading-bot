@@ -1132,204 +1132,108 @@ class DailyReporter:
     # ── v2.2 ledger-backed sections ──────────────────────────────────────────
 
     def _format_intelligence_section(self, d: dict) -> str:
-        """The five metrics that actually predict whether this compounds:
-        benchmark-relative return, long/short split, per-agent trend,
-        capital efficiency, and expectancy. Added 2026-07-28 — the old
-        report gave totals with no attribution or direction."""
-        if not _LEDGER_AVAILABLE:
-            return '<p style="color:#94a3b8">Ledger unavailable.</p>'
+        """Renders report_data.snapshot() — the single validated view.
+
+        Rebuilt 2026-07-31. This section previously computed its own
+        numbers from whichever source each block happened to pick, which
+        produced three silent, flattering errors in one week ($22k ledger
+        gap, missing trades, $6,960 one-day lag). It now renders only,
+        and prints the snapshot's warnings at the top so a disagreement
+        can never be resolved invisibly again.
+        """
         try:
-            from collections import defaultdict
-            trades = _ledger.epoch_trades()
-            closed = [t for t in trades if not t.is_open]
-            opens  = [t for t in trades if t.is_open]
+            from report_data import snapshot
+            s = snapshot()
         except Exception as e:
-            return f'<p style="color:#94a3b8">Intelligence unavailable: {e}</p>'
+            return f'<p style="color:#ef4444">Snapshot unavailable: {e}</p>'
 
-        def _pnl(t):
-            return (t.realized_pnl if not t.is_open else t.unrealized_pnl) or 0.0
+        def clr(v):
+            return "#22c55e" if (v or 0) >= 0 else "#ef4444"
 
-        def _clr(v):
-            return "#22c55e" if v >= 0 else "#ef4444"
+        # Warnings first — loud, un-ignorable, above every number
+        warn = ""
+        if s.get("warnings"):
+            items = "".join(f"<li style='margin:3px 0'>{w}</li>" for w in s["warnings"])
+            warn = (f'<div style="background:#fef2f2;border-left:4px solid #ef4444;'
+                    f'padding:12px 16px;border-radius:6px;margin:8px 0">'
+                    f'<div style="font-weight:700;color:#991b1b;margin-bottom:4px">'
+                    f'⚠️ Data integrity warnings</div>'
+                    f'<ul style="margin:0;padding-left:18px;font-size:12px;color:#7f1d1d">'
+                    f'{items}</ul></div>')
 
-        # ── 1. Benchmark: BROKER EQUITY vs SPY ────────────────────────
-        # Uses Alpaca's portfolio-history equity curve, NOT ledger P&L.
-        # 2026-07-30: the ledger version reported "+$2,376 (+2.38%),
-        # beating SPY by 1.90%" for a 5-day window in which real equity
-        # fell $19,908 — the ledger cannot see orphan/drift positions, so
-        # it reported a win during the worst drawdown of the account.
-        # Broker equity is the only number that cannot lie.
-        bench_rows, equity_now, equity_start = "", None, 100000.0
-        try:
-            import requests
-            hdr = {"APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY", ""),
-                   "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET", "")}
-            hist = requests.get(
-                "https://paper-api.alpaca.markets/v2/account/portfolio/history",
-                params={"period": "3M", "timeframe": "1D"}, headers=hdr, timeout=15).json()
-            eq = [e for e in (hist.get("equity") or []) if e]
-            spy = yf.Ticker("SPY").history(period="3mo", interval="1d")
+        if s.get("equity") is None:
+            return warn + '<p style="color:#ef4444">Broker unreachable — no figures.</p>'
 
-            # LIVE equity, not the history series. Alpaca only posts a
-            # daily history bar AFTER the session settles, so eq[-1] is
-            # always YESTERDAY. On 2026-07-31 that made the report show
-            # "+$4,209, equity $88,927" (Thursday's numbers) while the
-            # account was actually at $86,176 and down $2,750 — a $6,960
-            # error that reported a great day during a circuit-breaker halt.
-            acct = requests.get("https://paper-api.alpaca.markets/v2/account",
-                                headers=hdr, timeout=15).json()
-            equity_now = float(acct.get("equity") or 0)
-            prev_close = float(acct.get("last_equity") or 0)
+        head = (f'<div style="font-size:26px;font-weight:700;color:{clr(s["total_pnl"])}">'
+                f'${s["equity"]:,.0f}</div>'
+                f'<div style="font-size:12px;color:#64748b">account equity '
+                f'({s["total_pct"]:+.2f}% since $100k) &nbsp;•&nbsp; today '
+                f'<span style="color:{clr(s["day_pnl"])};font-weight:600">'
+                f'${s["day_pnl"]:+,.0f}</span> &nbsp;•&nbsp; buying power '
+                f'${s["buying_power"]:,.0f} &nbsp;•&nbsp; leverage '
+                f'{s.get("leverage",0):.2f}x</div>')
 
-            for label, days in (("1-day", 1), ("5-day", 5), ("20-day", 20), ("Since start", None)):
-                if days == 1:
-                    # today = live equity vs the broker's own prior close
-                    prev, spy_bars = prev_close, 1
-                elif days is None:
-                    prev, spy_bars = equity_start, len(spy) - 1
-                elif len(eq) >= days:
-                    prev, spy_bars = eq[-days], days
-                else:
-                    continue
-                if not prev:
-                    continue
-                chg = equity_now - prev
-                bot_pct = (equity_now / prev - 1) * 100 if prev else 0
-                spy_bars = min(spy_bars, len(spy) - 1)
-                spy_pct = ((float(spy["Close"].iloc[-1]) / float(spy["Close"].iloc[-1 - spy_bars]) - 1) * 100
-                           if spy_bars > 0 else 0.0)
-                edge = bot_pct - spy_pct
-                bench_rows += (
-                    f'<tr><td style="padding:6px 10px;font-weight:600">{label}</td>'
-                    f'<td style="padding:6px 10px;text-align:right;color:{_clr(chg)};font-weight:700">'
-                    f'${chg:+,.0f} ({bot_pct:+.2f}%)</td>'
-                    f'<td style="padding:6px 10px;text-align:right;color:{_clr(spy_pct)}">{spy_pct:+.2f}%</td>'
-                    f'<td style="padding:6px 10px;text-align:right;color:{_clr(edge)};font-weight:700">'
-                    f'{edge:+.2f}%</td></tr>')
-        except Exception as e:
-            bench_rows = (f'<tr><td colspan="4" style="padding:6px 10px;color:#ef4444">'
-                          f'broker equity unavailable: {e}</td></tr>')
-        equity_hdr = (f'<div style="font-size:26px;font-weight:700;color:{_clr((equity_now or 0)-100000)}">'
-                      f'${equity_now:,.0f}</div>'
-                      f'<div style="font-size:12px;color:#64748b">account equity '
-                      f'({(equity_now/100000-1)*100:+.1f}% since $100k start)</div>'
-                      ) if equity_now else ""
+        rows = "".join(
+            f'<tr><td style="padding:6px 10px;font-weight:600">{w["label"]}</td>'
+            f'<td style="padding:6px 10px;text-align:right;color:{clr(w["chg"])};font-weight:700">'
+            f'${w["chg"]:+,.0f} ({w["bot_pct"]:+.2f}%)</td>'
+            f'<td style="padding:6px 10px;text-align:right;color:{clr(w["spy_pct"])}">'
+            f'{w["spy_pct"]:+.2f}%</td>'
+            f'<td style="padding:6px 10px;text-align:right;color:{clr(w["edge"])};font-weight:700">'
+            f'{w["edge"]:+.2f}%</td></tr>' for w in s.get("windows", []))
 
-        # ── 2. Long vs short: are we trading both sides? ──────────────
-        side_rows = ""
-        for side in ("LONG", "SHORT"):
-            sc = [t for t in closed if t.side == side]
-            so = [t for t in opens if t.side == side]
-            n, w = len(sc), sum(1 for t in sc if _pnl(t) > 0)
-            p = sum(_pnl(t) for t in sc)
-            side_rows += (
-                f'<tr><td style="padding:6px 10px;font-weight:600">{side}</td>'
-                f'<td style="padding:6px 10px;text-align:right">{n}</td>'
-                f'<td style="padding:6px 10px;text-align:right">{len(so)}</td>'
-                f'<td style="padding:6px 10px;text-align:right">{(w/n*100) if n else 0:.0f}%</td>'
-                f'<td style="padding:6px 10px;text-align:right;color:{_clr(p)};font-weight:700">'
-                f'${p:+,.2f}</td></tr>')
+        opened = "".join(
+            f'<tr><td style="padding:5px 10px;font-size:12px">{t["time"]}</td>'
+            f'<td style="padding:5px 10px;font-weight:600">{t["symbol"]}</td>'
+            f'<td style="padding:5px 10px">{t["side"]}</td>'
+            f'<td style="padding:5px 10px;text-align:right">${t["notional"]:,.0f}</td>'
+            f'<td style="padding:5px 10px;font-size:11px;color:#64748b">{t["agent"][:34]}</td></tr>'
+            for t in s.get("opened_today", [])) or             '<tr><td colspan="5" style="padding:8px 10px;color:#94a3b8">no entries today</td></tr>'
 
-        # ── 3+4. Per-agent: trend, capital deployed, return on capital ─
-        ag = defaultdict(lambda: {"pnl": [], "cap": 0.0, "open": 0.0})
-        for t in trades:
-            name = t.primary_agent.replace("MetaAgent(", "").rstrip(")").split(",")[0].strip()
-            ag[name]["cap"] += (t.entry_price or 0) * (t.shares or 0)
-            if t.is_open:
-                ag[name]["open"] += _pnl(t)
-            else:
-                ag[name]["pnl"].append((t.exit_at_et or t.opened_at_et, _pnl(t)))
+        closed = "".join(
+            f'<tr><td style="padding:5px 10px;font-weight:600">{t["symbol"]}</td>'
+            f'<td style="padding:5px 10px">{t["side"]}</td>'
+            f'<td style="padding:5px 10px;text-align:right;color:{clr(t["pnl"])};font-weight:700">'
+            f'${t["pnl"]:+,.0f}</td>'
+            f'<td style="padding:5px 10px;font-size:11px;color:#64748b">{t["agent"][:34]}</td></tr>'
+            for t in s.get("closed_today", [])) or             '<tr><td colspan="4" style="padding:8px 10px;color:#94a3b8">no exits today</td></tr>'
 
-        agent_rows = ""
-        for name, dd in sorted(ag.items(),
-                               key=lambda x: -(sum(p for _, p in x[1]["pnl"]) + x[1]["open"])):
-            seq = [p for _, p in sorted(dd["pnl"])]
-            tot = sum(seq) + dd["open"]
-            n = len(seq)
-            recent, prior = seq[-5:], seq[-10:-5]
-            if len(recent) >= 3 and prior:
-                ra, pa = sum(recent) / len(recent), sum(prior) / len(prior)
-                trend = ("📈 improving", "#22c55e") if ra > pa else ("📉 decaying", "#ef4444")
-            else:
-                trend = ("— new", "#94a3b8")
-            roc = (tot / dd["cap"] * 100) if dd["cap"] else 0.0
-            wr = (sum(1 for p in seq if p > 0) / n * 100) if n else 0
-            # 5-day average: mean P&L per closed trade over the trailing
-            # 5 calendar days — shows current form, not lifetime average.
-            _cut5 = (_today_et() - timedelta(days=5)).strftime("%Y-%m-%d")
-            _r5 = [p for ts, p in dd["pnl"] if (ts or "")[:10] >= _cut5]
-            avg5 = (sum(_r5) / len(_r5)) if _r5 else 0.0
-            avg5_txt = f"${avg5:+,.0f}" if _r5 else "—"
-            agent_rows += (
-                f'<tr><td style="padding:6px 10px;font-weight:600;font-size:12px">{name}</td>'
-                f'<td style="padding:6px 10px;text-align:right">{n}</td>'
-                f'<td style="padding:6px 10px;text-align:right">{wr:.0f}%</td>'
-                f'<td style="padding:6px 10px;text-align:right;color:{_clr(tot)};font-weight:700">${tot:+,.0f}</td>'
-                f'<td style="padding:6px 10px;text-align:right;color:{_clr(avg5)};font-size:12px">{avg5_txt}</td>'
-                f'<td style="padding:6px 10px;text-align:right;font-size:11px">${dd["cap"]:,.0f}</td>'
-                f'<td style="padding:6px 10px;text-align:right;color:{_clr(roc)};font-weight:600">{roc:+.1f}%</td>'
-                f'<td style="padding:6px 10px;font-size:11px;color:{trend[1]}">{trend[0]}</td></tr>')
+        pos = "".join(
+            f'<tr><td style="padding:5px 10px;font-weight:600">{p["symbol"]}</td>'
+            f'<td style="padding:5px 10px">{p["side"]}{" OPT" if p["is_option"] else ""}</td>'
+            f'<td style="padding:5px 10px;text-align:right">${p["mv"]:,.0f}</td>'
+            f'<td style="padding:5px 10px;text-align:right;color:{clr(p["unrl"])};font-weight:700">'
+            f'${p["unrl"]:+,.0f}</td></tr>'
+            for p in sorted(s.get("positions", []), key=lambda x: -x["unrl"]))
 
-        # ── 5. Expectancy — the number that predicts compounding ──────
-        wins = [_pnl(t) for t in closed if _pnl(t) > 0]
-        loss = [_pnl(t) for t in closed if _pnl(t) <= 0]
-        aw = sum(wins) / len(wins) if wins else 0
-        al = abs(sum(loss) / len(loss)) if loss else 0
-        wr = len(wins) / len(closed) if closed else 0
-        exp = (wr * aw) - ((1 - wr) * al)
-        be = (al / (aw + al) * 100) if (aw + al) else 0
-        verdict = ("POSITIVE — system compounds at this geometry", "#22c55e") if exp > 0 else \
-                  ("NEGATIVE — more volume means more loss", "#ef4444")
-
+        th = 'style="padding:7px 10px;text-align:left"'
+        thr = 'style="padding:7px 10px;text-align:right"'
         return f"""
-    {equity_hdr}
-    <div class="section-title">🎯 Bot vs. Market — broker equity, not ledger</div>
+    {warn}
+    {head}
+    <div class="section-title">🎯 Bot vs. Market — broker equity</div>
     <table style="width:100%;border-collapse:collapse;font-size:13px">
-      <thead><tr style="background:#1e293b;color:#fff">
-        <th style="padding:7px 10px;text-align:left">Window</th>
-        <th style="padding:7px 10px;text-align:right">Bot</th>
-        <th style="padding:7px 10px;text-align:right">SPY</th>
-        <th style="padding:7px 10px;text-align:right">Edge</th>
-      </tr></thead><tbody>{bench_rows}</tbody></table>
+      <thead><tr style="background:#1e293b;color:#fff"><th {th}>Window</th>
+      <th {thr}>Bot</th><th {thr}>SPY</th><th {thr}>Edge</th></tr></thead>
+      <tbody>{rows}</tbody></table>
 
-    <div class="section-title">⚖️ Long vs Short — are we trading both sides?</div>
+    <div class="section-title">✅ Opened today</div>
     <table style="width:100%;border-collapse:collapse;font-size:13px">
-      <thead><tr style="background:#1e293b;color:#fff">
-        <th style="padding:7px 10px;text-align:left">Side</th>
-        <th style="padding:7px 10px;text-align:right">Closed</th>
-        <th style="padding:7px 10px;text-align:right">Open</th>
-        <th style="padding:7px 10px;text-align:right">Win%</th>
-        <th style="padding:7px 10px;text-align:right">P&amp;L</th>
-      </tr></thead><tbody>{side_rows}</tbody></table>
+      <thead><tr style="background:#1e293b;color:#fff"><th {th}>Time</th>
+      <th {th}>Symbol</th><th {th}>Side</th><th {thr}>Notional</th>
+      <th {th}>Agent</th></tr></thead><tbody>{opened}</tbody></table>
 
-    <div class="section-title">🤖 Agent Trend &amp; Capital Efficiency</div>
-    <table style="width:100%;border-collapse:collapse;font-size:12px">
-      <thead><tr style="background:#1e293b;color:#fff">
-        <th style="padding:7px 10px;text-align:left">Agent</th>
-        <th style="padding:7px 10px;text-align:right">Trades</th>
-        <th style="padding:7px 10px;text-align:right">Win%</th>
-        <th style="padding:7px 10px;text-align:right">Total P&amp;L</th>
-        <th style="padding:7px 10px;text-align:right">5d Avg</th>
-        <th style="padding:7px 10px;text-align:right">Allocated</th>
-        <th style="padding:7px 10px;text-align:right">Return</th>
-        <th style="padding:7px 10px;text-align:left">Trend</th>
-      </tr></thead><tbody>{agent_rows}</tbody></table>
-    <p style="font-size:11px;color:#94a3b8;margin:6px 0 0">
-      Return = P&amp;L ÷ capital deployed. Trend compares last 5 closed trades to the 5 before.
-      MetaAgent weights capital toward agents with positive P&amp;L; losers fall to the 0.40 floor.</p>
+    <div class="section-title">📕 Closed today</div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="background:#1e293b;color:#fff"><th {th}>Symbol</th>
+      <th {th}>Side</th><th {thr}>P&amp;L</th><th {th}>Agent</th></tr></thead>
+      <tbody>{closed}</tbody></table>
 
-    <div class="section-title">📐 Expectancy</div>
-    <table style="width:100%;border-collapse:collapse;font-size:13px"><tbody>
-      <tr><td style="padding:6px 10px">Avg win</td>
-          <td style="padding:6px 10px;text-align:right;color:#22c55e;font-weight:700">${aw:,.2f}</td></tr>
-      <tr><td style="padding:6px 10px">Avg loss</td>
-          <td style="padding:6px 10px;text-align:right;color:#ef4444;font-weight:700">${al:,.2f}</td></tr>
-      <tr><td style="padding:6px 10px">Win rate / breakeven needed</td>
-          <td style="padding:6px 10px;text-align:right;font-weight:700">{wr*100:.0f}% / {be:.0f}%</td></tr>
-      <tr style="background:#f1f5f9"><td style="padding:8px 10px;font-weight:700">Expectancy per trade</td>
-          <td style="padding:8px 10px;text-align:right;color:{verdict[1]};font-weight:700">${exp:+,.2f}</td></tr>
-    </tbody></table>
-    <p style="font-size:12px;color:{verdict[1]};margin:6px 0 0;font-weight:600">{verdict[0]}</p>
+    <div class="section-title">📂 Open positions ({len(s.get('positions', []))}) — unrealized ${s.get('unrealized') or 0:+,.0f}</div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead><tr style="background:#1e293b;color:#fff"><th {th}>Symbol</th>
+      <th {th}>Side</th><th {thr}>Value</th><th {thr}>Unreal.</th></tr></thead>
+      <tbody>{pos}</tbody></table>
 """
 
     def _format_daily_trends_section(self, d: dict) -> str:
@@ -1711,12 +1615,6 @@ class DailyReporter:
   <div class="body">
 
     {self._format_intelligence_section(d)}
-
-    <div class="section-title">📂 Currently Open Positions</div>
-    {open_positions_html}
-
-    <div class="section-title">✅ Today's Approved Trades</div>
-    {approved_html}
 
     <div class="section-title">⏱  System Health</div>
     <p style="font-size:13px;color:#475569;margin:0">

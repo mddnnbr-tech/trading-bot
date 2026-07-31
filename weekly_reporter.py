@@ -123,9 +123,24 @@ class WeeklyReporter:
         all_time_pnl   = sum(t["gross_pnl"] for t in all_trades)
         all_time_trades = len(all_trades)
 
-        # Portfolio return % this week
+        # Money comes from the broker snapshot, never the ledger. The
+        # ledger-derived weekly number reported "+$1,932" for a week the
+        # account fell — same class of error as the daily report's $22k
+        # gap. Attribution above stays ledger-sourced; equity does not.
         account_balance = float(os.getenv("ACCOUNT_BALANCE", "100000"))
         weekly_return_pct = (total_pnl / account_balance * 100) if account_balance else 0
+        try:
+            from report_data import snapshot
+            _s = snapshot()
+            if _s.get("equity") is not None:
+                account_balance = _s["equity"]
+                _w = next((w for w in _s.get("windows", []) if w["label"] == "5-day"), None)
+                if _w:
+                    total_pnl = _w["chg"]
+                    weekly_return_pct = _w["bot_pct"]
+                self._snapshot_warnings = _s.get("warnings", [])
+        except Exception as _e:
+            self._snapshot_warnings = [f"snapshot unavailable: {_e}"]
 
         return {
             "week_start":         week_start.strftime("%b %d"),
@@ -313,6 +328,13 @@ class WeeklyReporter:
         if not curve_rows:
             curve_rows = '<tr><td colspan="3" style="padding:12px;color:#94a3b8;text-align:center">Building equity history — check back next week</td></tr>'
 
+        _w = getattr(self, "_snapshot_warnings", []) or []
+        warn_block = ("" if not _w else
+            '<div style="background:#fef2f2;border-left:4px solid #ef4444;padding:12px 16px;'
+            'border-radius:6px;margin-bottom:14px"><b style="color:#991b1b">'
+            '⚠️ Data integrity warnings</b><ul style="margin:6px 0 0;padding-left:18px;'
+            'font-size:12px;color:#7f1d1d">' +
+            "".join(f"<li>{x}</li>" for x in _w) + '</ul></div>')
         return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><style>
@@ -345,6 +367,7 @@ class WeeklyReporter:
     <p>Week of {data['week_start']} – {data['week_end']}  •  Generated {data['generated_at']}</p>
   </div>
   <div class="body">
+    {warn_block}
     <div class="kpi-row">
       <div class="kpi">
         <div class="val" style="color:{pnl_color}">{pnl_sign}${data['total_pnl']:,.2f}</div>
