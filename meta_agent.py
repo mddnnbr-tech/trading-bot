@@ -156,9 +156,22 @@ class MetaAgent:
             log.info(f"MetaAgent: BEAR/HIGH_VOL regime — short bar eased to "
                      f"{_short_solo_bar}, long bar raised to {round(_long_solo_bar,2)}")
 
+        # Post-mortem 2026-07-31 (132 classified trades): NewsAgent alone
+        # accounts for -$4,793 of WRONG_DIRECTION and -$1,873 of GAP_LOSS —
+        # the single largest loss source in the system, and it carried
+        # weight 1.0 because the weighting counts UNREALIZED P&L from open
+        # winners while its closed record bleeds. Until its closed
+        # expectancy turns positive it may not enter a trade alone.
+        REQUIRE_CORROBORATION = {"NewsAgent"}
+
         kept = []
         for s in merged:
             n_agents = s.get("agent_count", 1)
+            _orig = str(s.get("original_agent") or s.get("agent") or "")
+            if n_agents < 2 and any(a in _orig for a in REQUIRE_CORROBORATION):
+                log.info(f"MetaAgent: dropped solo {s['symbol']} — "
+                         f"{_orig} requires corroboration (post-mortem: worst solo agent)")
+                continue
             if s["direction"] == "short" and n_agents < 2:
                 # Crash exception: consensus is impossible on dynamic-universe
                 # symbols only MoversAgent covers (new listings, screen-only
@@ -423,7 +436,12 @@ class MetaAgent:
             for t in all_trades:
                 if t.opened_at_et < cutoff_iso:
                     continue
-                pnl = (t.realized_pnl or 0.0) + (t.unrealized_pnl or 0.0)
+                # Closed P&L only. Counting unrealized marks let NewsAgent
+                # hold open winners to keep weight 1.0 while its closed
+                # trades lost $6.7k (post-mortem 2026-07-31).
+                if t.is_open:
+                    continue
+                pnl = t.realized_pnl or 0.0
                 for agent in t.all_agents:
                     if agent in agent_pnl:
                         agent_pnl[agent] += pnl
