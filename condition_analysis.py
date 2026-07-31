@@ -82,6 +82,22 @@ def backfill_entries() -> int:
     return added
 
 
+def _concentration(c, expr: str, bucket) -> float:
+    """Share of a bucket's absolute P&L coming from its top 2 trades.
+
+    Added after the 2026-07-31 near-miss: the '9-10am is our profitable
+    window' finding was 81% two trades, one of which was a manual
+    liquidation of an orphan position — not the strategy working. Any
+    bucket whose result rides on a couple of trades must be labelled, or
+    it will be acted on as though it were a pattern.
+    """
+    rows = [abs(r[0]) for r in c.execute(
+        f"SELECT m.pnl FROM entries e JOIN postmortems m ON e.trade_key=m.trade_key "
+        f"WHERE {expr} = ? ORDER BY ABS(m.pnl) DESC", (bucket,)).fetchall()]
+    tot = sum(rows)
+    return (sum(rows[:2]) / tot * 100) if tot else 0.0
+
+
 def _cut(c, expr: str, label: str) -> list[str]:
     """Win rate and avg P&L sliced by an arbitrary SQL expression."""
     rows = c.execute(f"""
@@ -92,16 +108,19 @@ def _cut(c, expr: str, label: str) -> list[str]:
                ROUND(SUM(m.pnl), 0)
         FROM entries e JOIN postmortems m ON e.trade_key = m.trade_key
         GROUP BY bucket ORDER BY bucket""").fetchall()
-    out = [f"### {label}", "", "| bucket | n | win% | avg P&L | total |",
-           "|---|---:|---:|---:|---:|"]
+    out = [f"### {label}", "", "| bucket | n | win% | avg P&L | total | reliability |",
+           "|---|---:|---:|---:|---:|---|"]
     seen = False
     for b, n, wr, avg, tot in rows:
         if n < MIN_CELL:
             continue
         seen = True
-        out.append(f"| {b} | {n} | {wr:.0f}% | ${avg:+,.0f} | ${tot:+,.0f} |")
+        conc = _concentration(c, expr, b)
+        flag = ("⚠️ top-2 trades = {:.0f}% — NOT a pattern".format(conc)
+                if conc >= 60 else "ok ({:.0f}% top-2)".format(conc))
+        out.append(f"| {b} | {n} | {wr:.0f}% | ${avg:+,.0f} | ${tot:+,.0f} | {flag} |")
     if not seen:
-        out.append(f"| _no bucket has {MIN_CELL}+ trades yet_ | | | | |")
+        out.append(f"| _no bucket has {MIN_CELL}+ trades yet_ | | | | | |")
     return out + [""]
 
 
