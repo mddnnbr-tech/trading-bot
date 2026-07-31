@@ -58,6 +58,16 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger("TradeLedger")
 
+# Load .env explicitly. This module is imported by cron jobs and run
+# standalone, where nothing else has loaded credentials — sync_from_broker
+# silently returned HTTP 401 in exactly that case, so the heal never ran
+# outside the main bot process.
+try:
+    from dotenv import load_dotenv as _ld
+    _ld(BASE_DIR / ".env")
+except Exception:
+    pass
+
 # ── Tunables ─────────────────────────────────────────────────────────────────
 DEFAULT_RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "320"))  # $ per trade
 MAX_HOLD_DAYS          = int(os.getenv("MAX_HOLD_DAYS", "5"))       # auto-expire after N
