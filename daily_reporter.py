@@ -805,10 +805,29 @@ class DailyReporter:
         # --- Scheduler log (truth source for tick health) ---
         sched = read_scheduler_today()
 
-        # --- Approved trades structured for table ---
-        approved_trades = []
+        # --- Approved trades: read the LEDGER, not trade_log.jsonl ---
+        # 2026-07-31: report said "No approved trades today" while the bot
+        # had submitted AXTI and CVX. Cause: this section still read
+        # trade_log.jsonl, the dead file nothing writes to — the same
+        # stale source that made the weekly report show all zeros.
+        ledger_today = []
+        try:
+            import trade_ledger as _lt
+            for t in _lt.trades_on_date(_today_str()):
+                ledger_today.append({
+                    "time":        (t.opened_at_et or "")[11:19],
+                    "symbol":      t.symbol,
+                    "direction":   "long" if t.side == "LONG" else "short",
+                    "agent":       str(t.primary_agent).replace("MetaAgent(", "").rstrip(")"),
+                    "confidence":  None,
+                    "risk_dollar": float(t.entry_price or 0) * float(t.shares or 0),
+                })
+        except Exception as _le:
+            log_err = str(_le)
+
+        approved_trades = list(ledger_today)
         total_notional = 0.0
-        for a in approved:
+        for a in (approved if not ledger_today else []):
             risk = a.get("risk_dollar") or a.get("risk")
             try:
                 risk_f = float(risk) if risk is not None else None
