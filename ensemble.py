@@ -158,6 +158,14 @@ class Ensemble:
         except Exception as _me:
             log.debug(f"options exit manager: {_me}")
 
+        # Step 1c: widen trails on positions that survived 2+ days —
+        # the 5d+ bucket is the only profitable holding period we have.
+        try:
+            from order_executor import widen_trails_on_survivors
+            widen_trails_on_survivors()
+        except Exception as _we:
+            log.debug(f"trail widening: {_we}")
+
         # Step 2: risk gate
         risk_status = self.risk.assess()
         if risk_status["halt_trading"]:
@@ -184,6 +192,17 @@ class Ensemble:
         except Exception:
             _cap = DAILY_TRADE_CAP
         entries_remaining = _cap - opened_today
+        # Concentrate entries in the first hour. Evidence 2026-07-31:
+        # 9-10am ran +$102/trade against the rest of the session on 38
+        # vs 95 trades. After 10am, hold back half the daily budget so
+        # the good window is never starved by mediocre later setups.
+        try:
+            from datetime import datetime as _d2
+            import trade_ledger as _tl2
+            if _d2.now(_tl2.ET).hour >= 10:
+                entries_remaining = min(entries_remaining, max(1, _cap // 2))
+        except Exception:
+            pass
         if entries_remaining <= 0:
             log.info(f"Daily trade cap reached ({opened_today}/{DAILY_TRADE_CAP}) "
                      f"— managing open positions only, no new entries today")
@@ -589,7 +608,12 @@ class Ensemble:
                 _mult = float(_tl_cfg().get("atr_stop_mult", 1.5))
             except Exception:
                 _mult = 1.5
+            # Cap stop width at 4% of entry. Evidence 2026-07-31: the
+            # 4%+ ATR bucket held 50 trades and -$3,604 — nearly all
+            # losses — vs +$200 for 2-4%. A volatile name does not earn
+            # a wider stop, it earns a smaller position.
             stop_dist = max(_mult * atr, entry * 0.01)
+            stop_dist = min(stop_dist, entry * 0.04)
             # target_price is a distant bookkeeping marker (4x stop) — the
             # real exit is the broker-side trailing stop, which is uncapped
             # on winners. Keeping the marker far out stops the ledger's

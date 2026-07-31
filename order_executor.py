@@ -273,6 +273,67 @@ class OrderExecutor:
             log.warning(f"Could not record to trade_ledger: {e}")
 
 
+def widen_trails_on_survivors(min_days: float = 2.0,
+                             widen_to_pct: float = 8.0) -> None:
+    """Give positions that survive 2 days a wider leash.
+
+    Strongest evidence in the dataset (2026-07-31): trades held 5+ days
+    won 59% at +$163 avg — the only profitable bucket — while the 1-2 day
+    bucket won 23% at -$184. The difference is trades cut before they
+    resolved. A position that has already survived two days has earned
+    room; widening its trail is what lets it reach the 5d+ bucket where
+    the money is. Winners only — a loser gets no extra rope.
+    """
+    ex = get_executor()
+    if ex._client is None:
+        return
+    try:
+        from alpaca.trading.requests import GetOrdersRequest, TrailingStopOrderRequest
+        from alpaca.trading.enums import QueryOrderStatus, OrderSide, TimeInForce
+        from datetime import datetime, timezone
+        import trade_ledger as _tl
+
+        held_days = {}
+        for t in _tl.open_positions():
+            try:
+                d = (datetime.now(_tl.ET)
+                     - datetime.fromisoformat(t.opened_at_et[:19]).replace(tzinfo=_tl.ET)).days
+                held_days[t.symbol.replace("/", "")] = d
+            except Exception:
+                continue
+
+        for p in ex._client.get_all_positions():
+            sym = str(p.symbol)
+            if len(sym) > 12:                      # options handled elsewhere
+                continue
+            if held_days.get(sym, 0) < min_days:
+                continue
+            if float(p.unrealized_pl) <= 0:        # losers get no extra rope
+                continue
+            orders = ex._client.get_orders(GetOrdersRequest(
+                status=QueryOrderStatus.OPEN, symbols=[sym]))
+            trails = [o for o in orders
+                      if str(getattr(o, "order_type", "")).lower().endswith("trailing_stop")]
+            if not trails:
+                continue
+            cur = float(getattr(trails[0], "trail_percent", 0) or 0)
+            if cur >= widen_to_pct:
+                continue
+            for o in trails:
+                ex._client.cancel_order_by_id(o.id)
+            import time as _t
+            _t.sleep(0.5)
+            side = OrderSide.SELL if int(p.qty) > 0 else OrderSide.BUY
+            ex._client.submit_order(TrailingStopOrderRequest(
+                symbol=sym, qty=abs(int(p.qty)), side=side,
+                trail_percent=widen_to_pct, time_in_force=TimeInForce.GTC))
+            log.info(f"🪢 TRAIL WIDENED: {sym} {cur:.1f}% -> {widen_to_pct:.1f}% "
+                     f"(held {held_days.get(sym)}d, +${float(p.unrealized_pl):,.0f}) "
+                     f"— letting it reach the 5d+ bucket")
+    except Exception as e:
+        log.warning(f"trail widening failed: {e}")
+
+
 # ── Module-level singleton ────────────────────────────────────────────────────
 _executor: Optional[OrderExecutor] = None
 
