@@ -178,7 +178,12 @@ class Ensemble:
                                 if "/" not in t.symbol])
         except Exception:
             opened_today = 0
-        entries_remaining = DAILY_TRADE_CAP - opened_today
+        try:
+            from auto_tune import load as _at_cfg
+            _cap = int(_at_cfg().get("daily_trade_cap", DAILY_TRADE_CAP))
+        except Exception:
+            _cap = DAILY_TRADE_CAP
+        entries_remaining = _cap - opened_today
         if entries_remaining <= 0:
             log.info(f"Daily trade cap reached ({opened_today}/{DAILY_TRADE_CAP}) "
                      f"— managing open positions only, no new entries today")
@@ -578,7 +583,13 @@ class Ensemble:
                 two_day = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-3]) - 1) * 100
                 if two_day <= -8.0:
                     signal["_falling_knife"] = f"{two_day:.1f}% over 2 days"
-            stop_dist = max(1.5 * atr, entry * 0.01)
+            # ATR multiple is auto-tuned weekly from post-mortem data
+            try:
+                from auto_tune import load as _tl_cfg
+                _mult = float(_tl_cfg().get("atr_stop_mult", 1.5))
+            except Exception:
+                _mult = 1.5
+            stop_dist = max(_mult * atr, entry * 0.01)
             # target_price is a distant bookkeeping marker (4x stop) — the
             # real exit is the broker-side trailing stop, which is uncapped
             # on winners. Keeping the marker far out stops the ledger's

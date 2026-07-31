@@ -149,9 +149,14 @@ class MetaAgent:
         # bull tape the original asymmetry stands, because it was correct
         # for 107 of the last 123 sessions. 2026-07-29 proved the cost of
         # applying bull-market rules on a -1000pt day.
+        try:
+            from auto_tune import load as _mt_cfg
+            _MIN_SOLO = float(_mt_cfg().get("min_solo_confidence", MIN_SOLO_CONFIDENCE))
+        except Exception:
+            _MIN_SOLO = MIN_SOLO_CONFIDENCE
         _bear = bool(active_regs & {"BEAR_TREND", "HIGH_VOL"})
-        _short_solo_bar = MIN_SOLO_CONFIDENCE if _bear else SOLO_SHORT_CONFIDENCE
-        _long_solo_bar  = (MIN_SOLO_CONFIDENCE + 0.08) if _bear else MIN_SOLO_CONFIDENCE
+        _short_solo_bar = _MIN_SOLO if _bear else SOLO_SHORT_CONFIDENCE
+        _long_solo_bar  = (_MIN_SOLO + 0.08) if _bear else _MIN_SOLO
         if _bear:
             log.info(f"MetaAgent: BEAR/HIGH_VOL regime — short bar eased to "
                      f"{_short_solo_bar}, long bar raised to {round(_long_solo_bar,2)}")

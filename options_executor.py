@@ -125,7 +125,12 @@ def execute_options_trade(signal: dict) -> dict | None:
     if not OPTIONS_ENABLED:
         return None
     conf = float(signal.get("raw_confidence") or signal.get("confidence") or 0)
-    if conf < OPTIONS_MIN_CONFIDENCE:
+    try:
+        from auto_tune import load as _oe_cfg
+        _thr = float(_oe_cfg().get("options_min_confidence", OPTIONS_MIN_CONFIDENCE))
+    except Exception:
+        _thr = OPTIONS_MIN_CONFIDENCE
+    if conf < _thr:
         return None
     symbol = signal.get("symbol", "")
     if not symbol or "/" in symbol:          # crypto has no options here
