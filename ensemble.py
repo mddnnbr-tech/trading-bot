@@ -329,6 +329,12 @@ class Ensemble:
                     # to shares.
                     opt = None
                     try:
+                        from trade_context import record_entry
+                        record_entry(result, regime=",".join(sorted(regimes)),
+                                     vix=float(risk_status.get("vix") or 0))
+                    except Exception:
+                        pass
+                    try:
                         from options_executor import execute_options_trade
                         opt = execute_options_trade(result)
                     except Exception as _oe:
