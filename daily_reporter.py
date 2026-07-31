@@ -121,53 +121,6 @@ def _to_et_time_str(ts_str: str) -> str:
 
 # ── Data readers ─────────────────────────────────────────────────────────────
 
-def read_trade_log_today() -> list[dict]:
-    """Return today's entries from trade_log.jsonl, ET-date-filtered."""
-    path = LOGS_DIR / "trade_log.jsonl"
-    if not path.exists():
-        return []
-    today = _today_str()
-    entries = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-            if _to_et_date_str(rec.get("timestamp", "")) == today:
-                entries.append(rec)
-        except json.JSONDecodeError:
-            continue
-    return entries
-
-
-def read_trade_log_recent_per_agent(days: int = 14) -> dict:
-    """Return {agent_name: most_recent_signal_iso} across last N days.
-    Used for 'last seen' silence detection."""
-    path = LOGS_DIR / "trade_log.jsonl"
-    if not path.exists():
-        return {}
-    cutoff = (_today_et() - timedelta(days=days)).strftime("%Y-%m-%d")
-    last_seen: dict[str, str] = {}
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-            d = _to_et_date_str(rec.get("timestamp", ""))
-            if d < cutoff:
-                continue
-            agent = rec.get("agent", "")
-            if not agent:
-                continue
-            if agent not in last_seen or d > _to_et_date_str(last_seen[agent]):
-                last_seen[agent] = rec.get("timestamp", "")
-        except json.JSONDecodeError:
-            continue
-    return last_seen
-
-
 def read_scheduler_today() -> dict:
     """Parse scheduler.log for today's tick health, errors, raw signal counts."""
     path = LOGS_DIR / "scheduler.log"
@@ -244,34 +197,6 @@ def read_scheduler_today() -> dict:
     return result
 
 
-def read_open_positions() -> list[dict]:
-    for name in ("open_positions.json", "positions.json", "portfolio.json"):
-        path = LOGS_DIR / name
-        if path.exists():
-            try:
-                data = json.loads(path.read_text())
-                if isinstance(data, list):
-                    return data
-                if isinstance(data, dict) and "positions" in data:
-                    return data["positions"]
-            except Exception:
-                continue
-    return []
-
-
-# ── Shadow P&L engine (Paper / Test) ─────────────────────────────────────────
-#
-# "Shadow" because no fills actually happened — we simulate what the P&L *would*
-# be if every approved signal had filled at the signal-time price and was still
-# held at last close. Caveats:
-#   • Assumes perfect fills at signal price (no slippage, no spread)
-#   • Assumes positions held until now (no stops, no profit targets)
-#   • Treats every signal as stock-equivalent — option leverage NOT modeled.
-#     For options/calls/puts the directional sign is correct but the dollar
-#     P&L is conservative (real options would amplify the move via delta).
-#
-# Replace this engine with read_live_fills() output once Phase B is wired.
-
 def _empty_pnl_summary(note: str = "") -> dict:
     return {
         "active":         False,
@@ -296,168 +221,6 @@ def _safe_float(v) -> float | None:
     except (TypeError, ValueError):
         return None
 
-
-def _batch_current_prices(symbols: list[str]) -> dict[str, float]:
-    """Fetch last close for each symbol via yfinance. Returns {symbol: price}."""
-    prices: dict[str, float] = {}
-    for sym in symbols:
-        if not sym or sym == "—":
-            continue
-        try:
-            hist = yf.Ticker(sym).history(period="2d", interval="1d")
-            if hist is not None and not hist.empty:
-                prices[sym] = float(hist["Close"].iloc[-1])
-        except Exception:
-            continue
-    return prices
-
-
-def _intraday_entry_price(symbol: str, timestamp_iso: str,
-                          cache: dict[str, object]) -> float | None:
-    """Look up the 5-min bar closest to a signal's timestamp for a fill estimate."""
-    if not timestamp_iso:
-        return None
-    if symbol not in cache:
-        try:
-            cache[symbol] = yf.Ticker(symbol).history(period="1d", interval="5m")
-        except Exception:
-            cache[symbol] = None
-    bars = cache.get(symbol)
-    if bars is None or bars.empty:
-        return None
-    try:
-        signal_dt = datetime.fromisoformat(timestamp_iso.replace("Z", "+00:00"))
-        if signal_dt.tzinfo is None:
-            signal_dt = signal_dt.replace(tzinfo=ET)
-        signal_dt_et = signal_dt.astimezone(ET)
-        if bars.index.tz is None:
-            bars.index = bars.index.tz_localize("UTC").tz_convert(ET)
-        else:
-            bars.index = bars.index.tz_convert(ET)
-        # Closest 5m bar to the signal time
-        deltas = [abs((idx - signal_dt_et).total_seconds()) for idx in bars.index]
-        i = deltas.index(min(deltas))
-        return float(bars["Close"].iloc[i])
-    except Exception:
-        return None
-
-
-def compute_shadow_pnl(approved_signals: list[dict]) -> dict:
-    """Calculate shadow P&L for today's approved signals.
-
-    Returns a summary dict with positions, totals, per-agent breakdown,
-    biggest winner/loser. Always returns a structured dict (never raises).
-    """
-    if not approved_signals:
-        return _empty_pnl_summary("No approved signals to simulate.")
-
-    symbols = sorted({s.get("symbol") for s in approved_signals
-                      if s.get("symbol") and s.get("symbol") != "—"})
-    if not symbols:
-        return _empty_pnl_summary("Approved signals had no parseable symbols.")
-
-    current_prices = _batch_current_prices(symbols)
-    intraday_cache: dict[str, object] = {}
-
-    positions: list[dict] = []
-    total_pnl = 0.0
-    total_notional = 0.0
-    wins = losses = 0
-    by_agent: dict[str, dict] = defaultdict(lambda: {"pnl": 0.0, "count": 0})
-    biggest_winner = None
-    biggest_loser  = None
-
-    for s in approved_signals:
-        symbol = s.get("symbol")
-        if not symbol or symbol == "—":
-            continue
-        current_price = current_prices.get(symbol)
-        if current_price is None or current_price <= 0:
-            continue
-
-        risk_f = _safe_float(s.get("risk_dollar") or s.get("risk"))
-        if not risk_f or risk_f <= 0:
-            continue
-
-        # Entry price — prefer signal-supplied; fall back to intraday yfinance bar
-        entry_price = (
-            _safe_float(s.get("entry_price"))
-            or _safe_float(s.get("price"))
-            or _safe_float(s.get("entry"))
-            or _intraday_entry_price(symbol, s.get("timestamp", ""), intraday_cache)
-            or current_price  # ultimate fallback → P&L = 0 for this position
-        )
-        if entry_price <= 0:
-            continue
-
-        direction = str(s.get("direction") or s.get("side") or "long").lower()
-        if direction in SHORT_DIRECTIONS:
-            sign = -1
-        else:
-            sign = 1  # default long if ambiguous
-
-        shares = risk_f / entry_price
-        pnl    = shares * (current_price - entry_price) * sign
-        pnl_pct = (pnl / risk_f * 100) if risk_f else 0.0
-
-        total_pnl      += pnl
-        total_notional += risk_f
-        if pnl >= 0:
-            wins += 1
-        else:
-            losses += 1
-
-        agent = s.get("agent", "Unknown")
-        by_agent[agent]["pnl"]   += pnl
-        by_agent[agent]["count"] += 1
-
-        position = {
-            "time":      _to_et_time_str(s.get("timestamp", "")),
-            "symbol":    symbol,
-            "direction": direction,
-            "agent":     agent,
-            "entry":     round(entry_price, 2),
-            "current":   round(current_price, 2),
-            "shares":    round(shares, 2),
-            "notional":  round(risk_f, 2),
-            "pnl":       round(pnl, 2),
-            "pnl_pct":   round(pnl_pct, 2),
-        }
-        positions.append(position)
-
-        if biggest_winner is None or pnl > biggest_winner["pnl"]:
-            biggest_winner = position
-        if biggest_loser is None or pnl < biggest_loser["pnl"]:
-            biggest_loser = position
-
-    total = wins + losses
-    return {
-        "active":         True,
-        "positions":      sorted(positions, key=lambda p: -p["pnl"]),
-        "total_pnl":      round(total_pnl, 2),
-        "total_notional": round(total_notional, 2),
-        "win_count":      wins,
-        "loss_count":     losses,
-        "win_rate":       round(wins / total * 100, 1) if total else 0.0,
-        "by_agent":       {a: {"pnl": round(d["pnl"], 2), "count": d["count"]}
-                           for a, d in by_agent.items()},
-        "biggest_winner": biggest_winner,
-        "biggest_loser":  biggest_loser,
-        "tickers_priced": len(current_prices),
-        "tickers_failed": len([s for s in symbols if s not in current_prices]),
-        "note":           "",
-    }
-
-
-# ── Ledger-backed P&L (v2.2) ─────────────────────────────────────────────────
-#
-# This replaces compute_shadow_pnl as the primary Paper-side P&L source.
-# Reads from data/paper_trades.csv (the new structured ledger) which is
-# populated by trade_ledger.parse_log() pulling from scheduler.log.
-#
-# Why a second function: compute_shadow_pnl reads from trade_log.jsonl which
-# the bot doesn't write to. The bot logs "PAPER TRADE:" lines straight into
-# scheduler.log. trade_ledger bridges that gap.
 
 def _ledger_summary_from_trades(trade_list, label_for_empty: str) -> dict:
     """Convert a list of trade_ledger.Trade objects into the dict shape the
@@ -580,89 +343,6 @@ def _ledger_position_to_dict(t) -> dict:
 # Until then, this returns an empty/STANDBY summary so the report still
 # renders the column with a clear "not yet wired" note.
 
-def read_live_fills() -> dict:
-    path = LOGS_DIR / "live_fills.jsonl"
-    if not path.exists():
-        return _empty_pnl_summary(
-            "Live execution not wired yet — Phase B (order execution shim) pending. "
-            "This column will auto-populate once live_fills.jsonl exists."
-        )
-
-    today = _today_str()
-    fills: list[dict] = []
-    for line in path.read_text(errors="ignore").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-            if _to_et_date_str(rec.get("timestamp", "")) == today:
-                fills.append(rec)
-        except json.JSONDecodeError:
-            continue
-
-    if not fills:
-        return _empty_pnl_summary("No live fills today.")
-
-    positions: list[dict] = []
-    total_pnl = 0.0
-    total_notional = 0.0
-    wins = losses = 0
-    by_agent: dict[str, dict] = defaultdict(lambda: {"pnl": 0.0, "count": 0})
-    biggest_winner = None
-    biggest_loser  = None
-
-    for f in fills:
-        pnl   = _safe_float(f.get("realized_pnl") or f.get("pnl")) or 0.0
-        risk  = _safe_float(f.get("notional") or f.get("risk_dollar")) or 0.0
-        agent = f.get("agent", "Unknown")
-        by_agent[agent]["pnl"]   += pnl
-        by_agent[agent]["count"] += 1
-        total_pnl      += pnl
-        total_notional += risk
-        if pnl >= 0:
-            wins += 1
-        else:
-            losses += 1
-        position = {
-            "time":      _to_et_time_str(f.get("timestamp", "")),
-            "symbol":    f.get("symbol", "—"),
-            "direction": f.get("direction", "—"),
-            "agent":     agent,
-            "entry":     _safe_float(f.get("entry")) or 0.0,
-            "current":   _safe_float(f.get("exit"))  or 0.0,
-            "shares":    _safe_float(f.get("shares")) or 0.0,
-            "notional":  risk,
-            "pnl":       round(pnl, 2),
-            "pnl_pct":   round(pnl / risk * 100, 2) if risk else 0.0,
-        }
-        positions.append(position)
-        if biggest_winner is None or pnl > biggest_winner["pnl"]:
-            biggest_winner = position
-        if biggest_loser is None or pnl < biggest_loser["pnl"]:
-            biggest_loser = position
-
-    total = wins + losses
-    return {
-        "active":         True,
-        "positions":      sorted(positions, key=lambda p: -p["pnl"]),
-        "total_pnl":      round(total_pnl, 2),
-        "total_notional": round(total_notional, 2),
-        "win_count":      wins,
-        "loss_count":     losses,
-        "win_rate":       round(wins / total * 100, 1) if total else 0.0,
-        "by_agent":       {a: {"pnl": round(d["pnl"], 2), "count": d["count"]}
-                           for a, d in by_agent.items()},
-        "biggest_winner": biggest_winner,
-        "biggest_loser":  biggest_loser,
-        "tickers_priced": len(fills),
-        "tickers_failed": 0,
-        "note":           "",
-    }
-
-
-# ── Diagnostic engine ────────────────────────────────────────────────────────
-
 def diagnose(report: dict) -> list[str]:
     """Return a list of human-readable findings about today's behavior."""
     findings = []
@@ -690,12 +370,7 @@ def diagnose(report: dict) -> list[str]:
             f"that don't have earnings — blacklist them from its universe."
         )
 
-    if report["approved_count"] == 0 and report["rejected_count"] == 0 and report["raw_signals_total"] > 0:
-        findings.append(
-            f"⚠️  {report['raw_signals_total']} raw signals fired but 0 approved/rejected "
-            f"in trade_log.jsonl. Either the synthesis layer isn't writing decisions, "
-            f"or the file path is wrong."
-        )
+    # (removed: this compared against trade_log.jsonl, a dead source)
 
     if report["approved_count"] == 0 and report["rejected_count"] > 0:
         # Check rejection reasons for tier confidence patterns
@@ -754,7 +429,7 @@ class DailyReporter:
         now = _today_et()
 
         # --- Trade log (signals approved/rejected) ---
-        signals_today = read_trade_log_today()
+        signals_today = []   # trade_log.jsonl is dead; ledger is authoritative
         approved = [s for s in signals_today if s.get("event") in APPROVED_EVENTS]
         rejected = [s for s in signals_today if s.get("event") in REJECTED_EVENTS]
 
@@ -781,8 +456,8 @@ class DailyReporter:
         if _LEDGER_AVAILABLE:
             shadow_pnl = compute_paper_pnl_from_ledger()
         else:
-            shadow_pnl = compute_shadow_pnl(approved)
-        live_pnl   = read_live_fills()
+            shadow_pnl = _empty_pnl_summary('shadow P&L retired — broker snapshot is authoritative')
+        live_pnl   = _empty_pnl_summary('live column retired — broker snapshot is authoritative')
 
         # --- v2.2: portfolio + per-agent attribution from ledger ---
         if _LEDGER_AVAILABLE:
@@ -878,7 +553,7 @@ class DailyReporter:
         total_wins = sum(1 for t in closed_today if t.get("gross_pnl", 0) >= 0)
 
         # --- Last-seen per agent (silence detection) ---
-        agent_last_seen = read_trade_log_recent_per_agent(days=14)
+        agent_last_seen = {}  # dead source removed
 
         # --- Raw signal totals from scheduler.log ---
         raw_signals_total = max((n for _, n in sched["raw_signal_ticks"]), default=0)
@@ -916,7 +591,7 @@ class DailyReporter:
             "raw_signals_total":    raw_signals_total,
             "passed_synthesis":     passed_synthesis,
             "approved_batches":     approved_batches_total,
-            "open_positions":       read_open_positions(),
+            "open_positions":       [],   # broker snapshot supplies this
             "all_time_pnl":         round(all_time_pnl, 2),
             "all_time_trades":      all_time_trades,
             "daily_return_pct":     round(daily_return_pct, 2),
@@ -1626,7 +1301,8 @@ class DailyReporter:
   <div class="footer">
     Trading Bot Daily Report v2.2 • Paper Trading (Phase D) • Auto-generated.<br>
     Truth sources: data/paper_trades.csv (ledger) + scheduler.log + yfinance.<br>
-    Live column auto-activates when logs/live_fills.jsonl appears (Phase B).
+    Money figures come from report_data.snapshot() (broker); the ledger
+    supplies attribution only.
   </div>
 </div></body></html>"""
 

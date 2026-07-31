@@ -116,10 +116,17 @@ class WeeklyReporter:
         regime_summary = self._get_regime_summary()
 
         # Running portfolio equity (all-time cumulative P&L by week)
-        all_trades    = self.logger.get_trades(last_n_days=365)
+        # Equity curve and all-time totals from the LEDGER, not the dead
+        # PerformanceLogger -- get_trades() returned nothing, so the curve
+        # rendered empty and all-time P&L showed $0 every week.
+        try:
+            import trade_ledger as _tl2
+            all_trades = [{"timestamp": (t.exit_at_et or t.opened_at_et),
+                           "gross_pnl": (t.realized_pnl or 0.0)}
+                          for t in _tl2.all_trades() if not t.is_open]
+        except Exception:
+            all_trades = []
         equity_curve  = self._build_equity_curve(all_trades)
-
-        # All-time totals
         all_time_pnl   = sum(t["gross_pnl"] for t in all_trades)
         all_time_trades = len(all_trades)
 
