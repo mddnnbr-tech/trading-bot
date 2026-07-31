@@ -169,7 +169,7 @@ def classify_closed_trades(limit: int = 60) -> dict:
                         mode = "WRONG_DIRECTION"
                         evidence = f"moved against and never recovered ({held:.1f}d)"
 
-                c.execute("INSERT OR REPLACE INTO postmortems VALUES(?,?,?,?,?,?,?,?,?,?)", (
+                c.execute("INSERT OR REPLACE INTO postmortems VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
                     key, t.symbol, t.side,
                     str(t.primary_agent).replace("MetaAgent(", "").rstrip(")").split(",")[0].strip(),
                     exit_ts, round(pnl, 2), mode, evidence, recovered, gapped, round(held, 2)))
