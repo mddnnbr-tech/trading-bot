@@ -319,14 +319,32 @@ def widen_trails_on_survivors(min_days: float = 2.0,
             cur = float(getattr(trails[0], "trail_percent", 0) or 0)
             if cur >= widen_to_pct:
                 continue
+            # Cancel-then-submit is NOT atomic: if the submit fails, the
+            # position is left with NO exit order at all. The invariant
+            # check found 14 positions naked this way on 2026-08-04 —
+            # unbounded downside on the entire equity book. Verify the
+            # replacement exists, and restore the original protection if
+            # it does not.
+            import time as _t
+            side = OrderSide.SELL if int(p.qty) > 0 else OrderSide.BUY
             for o in trails:
                 ex._client.cancel_order_by_id(o.id)
-            import time as _t
             _t.sleep(0.5)
-            side = OrderSide.SELL if int(p.qty) > 0 else OrderSide.BUY
-            ex._client.submit_order(TrailingStopOrderRequest(
-                symbol=sym, qty=abs(int(p.qty)), side=side,
-                trail_percent=widen_to_pct, time_in_force=TimeInForce.GTC))
+            try:
+                ex._client.submit_order(TrailingStopOrderRequest(
+                    symbol=sym, qty=abs(int(p.qty)), side=side,
+                    trail_percent=widen_to_pct, time_in_force=TimeInForce.GTC))
+            except Exception as _se:
+                log.error(f"trail widen FAILED for {sym} ({_se}) — restoring "
+                          f"original {cur:.1f}% protection")
+                try:
+                    ex._client.submit_order(TrailingStopOrderRequest(
+                        symbol=sym, qty=abs(int(p.qty)), side=side,
+                        trail_percent=max(cur, 2.0), time_in_force=TimeInForce.GTC))
+                except Exception as _re:
+                    log.critical(f"{sym} IS UNPROTECTED — both widen and restore "
+                                 f"failed ({_re}); invariant check will flag it")
+                continue
             log.info(f"🪢 TRAIL WIDENED: {sym} {cur:.1f}% -> {widen_to_pct:.1f}% "
                      f"(held {held_days.get(sym)}d, +${float(p.unrealized_pl):,.0f}) "
                      f"— letting it reach the 5d+ bucket")
