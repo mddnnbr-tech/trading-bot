@@ -540,7 +540,26 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                     age_days  = (now_et - opened_dt).days
                 except Exception:
                     age_days = 0
-                if age_days >= MAX_HOLD_DAYS and last_price is not None:
+                # NEVER expire a position the broker still holds. This is
+                # the same double-count the stop/target override fixed, in
+                # the branch it did not cover: setting status=None routed
+                # broker-held trades straight INTO this expiry path, which
+                # booked their UNREALIZED gains as REALIZED while the
+                # position stayed open — on 2026-08-04 that reported
+                # +$13,178 "realized" against a real broker day of +$2,175,
+                # an $11,003 phantom profit (RNG +$4,245, GOOGL +$2,280,
+                # SAP +$1,620 were all still open).
+                #
+                # It also contradicted the strongest finding in the data:
+                # the 5d+ holding bucket is the only profitable one, and a
+                # 5-day forced expiry closed exactly those winners on paper
+                # while their trailing stops kept running (RNG 11d, PLTR 36d).
+                _broker_holds = (broker_open is not None
+                                 and t.symbol.replace("/", "") in broker_open)
+                if _broker_holds and age_days >= MAX_HOLD_DAYS:
+                    log.debug(f"{t.symbol}: {age_days}d old but broker still holds it "
+                              f"— not expiring (trail active)")
+                if (not _broker_holds) and age_days >= MAX_HOLD_DAYS and last_price is not None:
                     t.status         = "expired"
                     t.exit_price     = last_price
                     t.exit_at_et     = now_iso
