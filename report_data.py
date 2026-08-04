@@ -174,6 +174,17 @@ def snapshot() -> dict:
     except Exception:
         d["orphans"] = []
 
+    # Invariant layer — explicit rules plus statistical anomaly detection.
+    # The snapshot's own checks catch what it computes; invariants.py
+    # checks the things NO single module owns (orphans, unprotected
+    # positions, double-counted P&L, stacking, leverage, novel outliers).
+    try:
+        from invariants import report as _inv
+        for i in _inv():
+            d["warnings"].append(f"[{i['severity']}] {i['rule']}: {i['detail']}")
+    except Exception as _ie:
+        d["warnings"].append(f"invariant check unavailable ({_ie})")
+
     if d.get("leverage", 0) > 2.0:
         d["warnings"].append(f"LEVERAGE {d['leverage']:.2f}x — gross exposure "
                              f"${d['gross_exposure']:,.0f} on ${d['equity']:,.0f} equity")
