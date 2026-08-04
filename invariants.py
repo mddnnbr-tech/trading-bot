@@ -115,13 +115,33 @@ def check_all() -> list[dict]:
 
     # ── 4. Every equity position needs a live exit order, or it is
     #      unprotected — no stop, unbounded downside.
+    # Crypto is excluded by design: Alpaca supports no exit orders on
+    # crypto, so manage_crypto_exits() polls every 15 min instead. That
+    # substitution is only valid while the poller is actually running —
+    # checked separately below rather than assumed.
+    def _is_crypto(sym): return sym.endswith("USD") and len(sym) > 5
     protected = {o["symbol"] for o in orders}
-    naked = [p["symbol"] for p in equities if p["symbol"] not in protected]
+    naked = [p["symbol"] for p in equities
+             if p["symbol"] not in protected and not _is_crypto(p["symbol"])]
     if naked:
         fail("CRITICAL", "all_positions_protected",
              f"{len(naked)} position(s) have NO exit order: "
              f"{', '.join(sorted(naked)[:8])} — unbounded downside",
              "resubmit trailing stops")
+
+    # Crypto's protection IS the poller. If it stops, those positions are
+    # silently unprotected with nothing at the broker to catch them.
+    if any(_is_crypto(p["symbol"]) for p in positions):
+        try:
+            cl = BASE / "logs" / "crypto_scheduler.log"
+            age_min = (datetime.now().timestamp() - cl.stat().st_mtime) / 60
+            if age_min > 45:
+                fail("CRITICAL", "crypto_exit_poller_alive",
+                     f"crypto positions open but the exit poller has not run in "
+                     f"{age_min:.0f} min — they have NO protection of any kind",
+                     "check the */15 crypto_scheduler cron")
+        except Exception as e:
+            fail("WARN", "crypto_exit_poller_alive", f"cannot verify poller: {e}")
 
     # ── 5. One position per symbol. Duplicate stacking cost -$460/day
     #      in July and froze the account twice.
