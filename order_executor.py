@@ -273,6 +273,28 @@ class OrderExecutor:
             log.warning(f"Could not record to trade_ledger: {e}")
 
 
+def _trail_for_profit(pct_gain: float) -> float:
+    """Progressive trail: the bigger the gain, the tighter the protection.
+
+    A flat 8% trail is right for a small winner that needs room to breathe
+    and badly wrong for a large one. On 2026-08-07 the book held $10,653
+    unrealized with ~$4,865 of it exposed — RNG was +$4,780 with $1,827
+    at risk, and JBS/SPY would have exited BELOW their current price.
+    Giving back half of every winner defeats the asymmetry the trailing
+    stop exists to create.
+
+    Ratchet: room while the trade is proving itself, protection once it
+    has proved itself.
+    """
+    if pct_gain >= 15:
+        return 3.0
+    if pct_gain >= 8:
+        return 4.0
+    if pct_gain >= 4:
+        return 5.5
+    return 8.0
+
+
 def widen_trails_on_survivors(min_days: float = 2.0,
                              widen_to_pct: float = 8.0) -> None:
     """Give positions that survive 2 days a wider leash.
@@ -316,9 +338,17 @@ def widen_trails_on_survivors(min_days: float = 2.0,
                       if str(getattr(o, "order_type", "")).lower().endswith("trailing_stop")]
             if not trails:
                 continue
+            # Target trail is driven by how much profit there is to
+            # protect, not by a fixed widen-to value.
+            try:
+                gain_pct = float(p.unrealized_plpc) * 100
+            except Exception:
+                gain_pct = 0.0
+            target_pct = _trail_for_profit(gain_pct)
             cur = float(getattr(trails[0], "trail_percent", 0) or 0)
-            if cur >= widen_to_pct:
+            if abs(cur - target_pct) < 0.5:
                 continue
+            widen_to_pct = target_pct
             # Cancel-then-submit is NOT atomic: if the submit fails, the
             # position is left with NO exit order at all. The invariant
             # check found 14 positions naked this way on 2026-08-04 —
@@ -345,9 +375,9 @@ def widen_trails_on_survivors(min_days: float = 2.0,
                     log.critical(f"{sym} IS UNPROTECTED — both widen and restore "
                                  f"failed ({_re}); invariant check will flag it")
                 continue
-            log.info(f"🪢 TRAIL WIDENED: {sym} {cur:.1f}% -> {widen_to_pct:.1f}% "
-                     f"(held {held_days.get(sym)}d, +${float(p.unrealized_pl):,.0f}) "
-                     f"— letting it reach the 5d+ bucket")
+            log.info(f"🪢 TRAIL {sym} {cur:.1f}% -> {widen_to_pct:.1f}% "
+                     f"(held {held_days.get(sym)}d, {gain_pct:+.1f}%, "
+                     f"${float(p.unrealized_pl):+,.0f}) — protection scaled to gain")
     except Exception as e:
         log.warning(f"trail widening failed: {e}")
 
