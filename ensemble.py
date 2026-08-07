@@ -211,11 +211,19 @@ class Ensemble:
             open_count = len([t for t in _tl.open_positions() if "/" not in t.symbol])
         except Exception:
             open_count = 0
-        if open_count >= MAX_OPEN_POSITIONS:
-            log.info(f"Max open positions reached ({open_count}/{MAX_OPEN_POSITIONS}) "
-                     f"— waiting for exits before new entries")
+        # Position COUNT no longer gates entries (2026-08-07). The count was
+        # always a crude proxy for the real constraint, which is capital —
+        # and it misfired badly: a ledger reconciliation left 254 phantom
+        # "open" rows against a cap of 15 and froze all trading, on a week
+        # the system was finally beating SPY. Capital and leverage are the
+        # true limits and both are enforced below and asserted every 20
+        # minutes by invariants.py (buying-power floor, 2.5x leverage
+        # ceiling). MAX_OPEN_POSITIONS is retained only as a far-outlier
+        # circuit breaker for runaway accumulation.
+        if open_count >= MAX_OPEN_POSITIONS * 3:
+            log.warning(f"Runaway position count ({open_count}) — halting entries; "
+                        f"this indicates a reconciliation fault, not normal trading")
             return []
-        entries_remaining = min(entries_remaining, MAX_OPEN_POSITIONS - open_count)
 
         # Capital gate — the real constraint. Deploy freely while buying
         # power exists; stand down just before the wall instead of firing
