@@ -104,8 +104,12 @@ def check_all() -> list[dict]:
     # ── 3. No trade may be counted realized AND still open (the $11,003
     #      double-count). Same symbol closed today yet held now.
     today = datetime.now().strftime("%Y-%m-%d")
+    # Only NON-ZERO realized P&L inflates a report. A row closed flat
+    # during reconciliation shares the shape but causes no harm — flagging
+    # it would train us to ignore this rule, which is worse than the bug.
     dbl = [t.symbol for t in all_trades
            if not t.is_open and (t.exit_at_et or "")[:10] == today
+           and abs(t.realized_pnl or 0.0) > 1.0
            and t.symbol.replace("/", "") in broker_syms]
     if dbl:
         fail("CRITICAL", "no_double_counted_pnl",
