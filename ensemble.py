@@ -45,11 +45,15 @@ ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "16000"))
 # which is exactly the bleed pattern the clean-epoch data convicted.
 DAILY_TRADE_CAP = int(os.getenv("DAILY_TRADE_CAP", "4"))
 
-# Max concurrent open equity positions. The daily cap limits FLOW but not
-# STOCK: trailing exits let positions ride for days, so 8/day quietly
-# stacked 25 open positions by 2026-07-23 and buying power hit ~$0 —
-# every new order (incl. shorts, which need margin headroom) bounced all
-# day. Portfolio must stay concentrated: new entries wait for exits.
+# Runaway circuit breaker only — entries are gated at 3x this, NOT at this
+# value (changed 2026-08-07). History: 8 entries/day stacked 25 open
+# positions by 2026-07-23 and buying power hit ~$0, so a count cap was
+# added. But count was always a proxy for the real constraint, capital,
+# and the proxy failed loudly on 2026-08-07: a ledger reconciliation left
+# 254 phantom "open" rows against a cap of 15 and froze ALL trading during
+# the first week the system beat SPY. Buying power (the $20k reserve gate)
+# and leverage (2.5x ceiling) are the true limits, both enforced below and
+# asserted every 20 min by invariants.py.
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "10"))
 
 # Hard cap on the learner's blacklist. Guards against the failure found
