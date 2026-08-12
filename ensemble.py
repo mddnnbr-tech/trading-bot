@@ -275,10 +275,14 @@ class Ensemble:
             if _c is not None:
                 _acct = _c.get_account()
                 _eq = float(_acct.equity)
-                _pos = _c.get_all_positions()
-                _mv = [float(p.market_value) for p in _pos]
-                _gross = sum(abs(v) for v in _mv) / _eq if _eq else 0.0
-                _net = sum(_mv) / _eq if _eq else 0.0
+                # Signed exposure, not market value: a long inverse ETF is
+                # SHORT exposure, and leveraged funds carry a multiple of
+                # their value. Reading raw market_value would have counted
+                # SQQQ as long while it hedged the book.
+                from exposure import book_exposure
+                _g, _n = book_exposure(_c.get_all_positions())
+                _gross = _g / _eq if _eq else 0.0
+                _net = _n / _eq if _eq else 0.0
                 if _gross > MAX_GROSS_LEVERAGE_ENTRY:
                     block_longs = (f"gross leverage {_gross:.2f}x > "
                                    f"{MAX_GROSS_LEVERAGE_ENTRY:.2f}x")

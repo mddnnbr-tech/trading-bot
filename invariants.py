@@ -170,7 +170,9 @@ def check_all() -> list[dict]:
     #      to up, while realized P&L was positive — the exposure was the loss,
     #      not the trades. Entries gate on this in ensemble.py; this is the
     #      report-side mirror so drift is visible rather than inferred.
-    net = sum(float(p["market_value"]) for p in positions) / equity if equity else 0
+    from exposure import book_exposure
+    _g, _n = book_exposure(positions)
+    net = _n / equity if equity else 0
     if net > 1.15:
         fail("WARN", "net_long_exposure",
              f"net long {net*100:.0f}% of equity (gross {lev:.2f}x) — a flat "
