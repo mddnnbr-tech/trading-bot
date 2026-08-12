@@ -85,7 +85,14 @@ def check_all() -> list[dict]:
 
     # ── 1. No position may be closed in the ledger while the broker
     #      holds it. Violated 4x this week; source of every phantom gain.
-    orphans = broker_syms - set(ledger_open)
+    # Options are excluded from both directions: they never reach
+    # trade_ledger by design (options_executor.py:144), so every open
+    # contract would register as a permanent orphan. A rule that always
+    # fires is a rule everyone learns to scroll past. Option risk is
+    # covered instead by rule 8 (premium within budget) and by
+    # manage_options_exits() running each tick.
+    equity_syms = {s for s in broker_syms if len(s) <= 12}
+    orphans = equity_syms - set(ledger_open)
     if orphans:
         fail("WARN", "no_orphan_positions",
              f"broker holds {len(orphans)} position(s) the ledger closed: "
