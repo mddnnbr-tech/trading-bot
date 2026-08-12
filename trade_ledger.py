@@ -481,6 +481,40 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                     f"falling back to price simulation this run")
         broker_open = None
 
+    # Recent closing fills, so an exit can be attributed to what actually
+    # happened rather than to whichever branch noticed it first.
+    #
+    # RNG (2026-08-10) is the case this fixes: a 3% trailing stop captured a
+    # +29% run and sold 369 shares at $62.55. Because the broker no longer
+    # held it, the expiry branch below then fired and stamped the row
+    # "expired after 16d". The dollars were right, but daily_postmortem.py
+    # and the strategy learner key on exit_reason — so the best trade of the
+    # week was teaching the system that holding to expiry wins, when the
+    # truth was that a tight trail on a runner wins. Mislabelled causes are
+    # worse than missing ones: the loop learns confidently in the wrong
+    # direction.
+    broker_fills: dict[str, tuple[float, str]] = {}
+    try:
+        import os as _os, requests as _rq
+        from datetime import timedelta as _td
+        _h = {"APCA-API-KEY-ID": _os.getenv("ALPACA_API_KEY", ""),
+              "APCA-API-SECRET-KEY": _os.getenv("ALPACA_API_SECRET", "")}
+        _since = (datetime.now(ET) - _td(days=5)).strftime("%Y-%m-%d")
+        _fr = _rq.get("https://paper-api.alpaca.markets/v2/account/activities/FILL",
+                      headers=_h, params={"after": _since, "page_size": 100}, timeout=15)
+        if _fr.status_code == 200:
+            for _a in _fr.json():
+                _sym = _a.get("symbol")
+                if not _sym:
+                    continue
+                # Keep the latest fill per symbol; partial fills of the same
+                # exit arrive seconds apart and any of them dates it fine.
+                _prev = broker_fills.get(_sym)
+                if _prev is None or _a["transaction_time"] > _prev[1]:
+                    broker_fills[_sym] = (float(_a["price"]), _a["transaction_time"])
+    except Exception as _fe:
+        log.debug(f"fill history unavailable ({_fe}) — exit attribution degrades")
+
     # Group by symbol so we minimize yfinance calls
     by_symbol: dict[str, list[Trade]] = defaultdict(list)
     for t in open_trades:
@@ -560,11 +594,23 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                     log.debug(f"{t.symbol}: {age_days}d old but broker still holds it "
                               f"— not expiring (trail active)")
                 if (not _broker_holds) and age_days >= MAX_HOLD_DAYS and last_price is not None:
-                    t.status         = "expired"
-                    t.exit_price     = last_price
-                    t.exit_at_et     = now_iso
-                    t.exit_reason    = f"expired after {age_days}d"
-                    t.realized_pnl   = _pnl_for(t, last_price)
+                    # The broker no longer holds it. If a real fill exists,
+                    # that fill IS the exit — price it and name it correctly.
+                    # Only a position that left with no fill behind it was
+                    # genuinely closed by hold-time expiry.
+                    _fill = broker_fills.get(t.symbol.replace("/", ""))
+                    if _fill is not None:
+                        _px, _when = _fill
+                        t.status       = "stop"
+                        t.exit_price   = _px
+                        t.exit_at_et   = _when[:19].replace("T", " ")
+                        t.exit_reason  = f"trail stop hit after {age_days}d"
+                    else:
+                        t.status       = "expired"
+                        t.exit_price   = last_price
+                        t.exit_at_et   = now_iso
+                        t.exit_reason  = f"expired after {age_days}d"
+                    t.realized_pnl   = _pnl_for(t, t.exit_price)
                     t.unrealized_pnl = 0.0
                     expired += 1
                 else:
