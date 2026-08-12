@@ -56,6 +56,25 @@ DAILY_TRADE_CAP = int(os.getenv("DAILY_TRADE_CAP", "4"))
 # asserted every 20 min by invariants.py.
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "10"))
 
+# Net-exposure entry gate — the constraint that actually predicts the losses.
+# Measured 2026-08-12: the book sat at 1.87x gross and 102% net long, and on
+# Aug 10/11/12 it lost 1.2-1.5% a day while SPY was flat to UP. Realized P&L
+# over those same three days was POSITIVE (+$3,399, avg loss held to -$363) —
+# the trades were fine. What bled was carrying a correlated growth/tech long
+# book at leverage through a flat tape.
+#
+# Neither existing gate binds there: buying power was $31k (reserve is $20k)
+# and the 2.5x leverage invariant is a disaster ceiling, not an operating
+# limit. Removing the position-count cap on 2026-08-07 was right — count was
+# a bad proxy — but it left no brake at all, and gross went 1.47x -> 1.87x in
+# three sessions. This is the brake that should have shipped alongside it.
+#
+# Shorts are exempt from both limits: they were the only profitable sleeve
+# (VFC +$702, FICO +$539, GME +$361, AVGO +$296, all green) and every short
+# REDUCES net exposure, so blocking them would be backwards.
+MAX_GROSS_LEVERAGE_ENTRY = float(os.getenv("MAX_GROSS_LEVERAGE_ENTRY", "1.6"))
+MAX_NET_LONG_PCT = float(os.getenv("MAX_NET_LONG_PCT", "0.85"))
+
 # Hard cap on the learner's blacklist. Guards against the failure found
 # 2026-07-30: a learner trained on corrupted-era data blacklisted 40
 # symbols (the entire universe) and would have stopped the bot trading.
@@ -245,6 +264,33 @@ class Ensemble:
         except Exception:
             pass
 
+        # Step 2a-bis: net-exposure gate. Blocks new LONGS once the book is
+        # already carrying too much directional risk, while leaving shorts
+        # free (they cut net exposure rather than add to it). Read from the
+        # broker, never the ledger — the ledger has been wrong four times.
+        block_longs = ""
+        try:
+            from order_executor import get_executor
+            _c = get_executor()._client
+            if _c is not None:
+                _acct = _c.get_account()
+                _eq = float(_acct.equity)
+                _pos = _c.get_all_positions()
+                _mv = [float(p.market_value) for p in _pos]
+                _gross = sum(abs(v) for v in _mv) / _eq if _eq else 0.0
+                _net = sum(_mv) / _eq if _eq else 0.0
+                if _gross > MAX_GROSS_LEVERAGE_ENTRY:
+                    block_longs = (f"gross leverage {_gross:.2f}x > "
+                                   f"{MAX_GROSS_LEVERAGE_ENTRY:.2f}x")
+                elif _net > MAX_NET_LONG_PCT:
+                    block_longs = (f"net long {_net*100:.0f}% > "
+                                   f"{MAX_NET_LONG_PCT*100:.0f}% of equity")
+                if block_longs:
+                    log.info(f"📉 Long entries blocked — {block_longs}; "
+                             f"shorts still allowed (they reduce net)")
+        except Exception as _ee:
+            log.debug(f"exposure gate: {_ee}")
+
         # Step 2b: dynamic universe injection — the whole market via funnel.
         # Static watchlists cover ~40 core names; the market-wide screens
         # (gainers/losers/most-active) find whatever ELSE is moving today —
@@ -344,6 +390,11 @@ class Ensemble:
                 if signal["symbol"] in self._avoid_symbols():
                     log.info(f"🧠 SKIPPED: {signal['symbol']:6} {signal['direction']:5} "
                              f"— on learner's avoid list (persistent loser)")
+                    continue
+
+                if block_longs and str(signal.get("direction", "")).lower() != "short":
+                    log.info(f"📉 SKIPPED: {signal['symbol']:6} {signal['direction']:5} "
+                             f"— {block_longs}")
                     continue
 
                 signal = self._normalize_geometry(signal)

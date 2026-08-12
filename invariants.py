@@ -164,6 +164,23 @@ def check_all() -> list[dict]:
     elif lev > 2.0:
         fail("WARN", "leverage_ceiling", f"leverage {lev:.2f}x approaching limit")
 
+    # ── 6b. Net long exposure. Distinct from rule 6: gross leverage can sit
+    #      inside its ceiling while the book is still lopsidedly directional.
+    #      Aug 10-12 lost 1.2-1.5%/day at 102% net long on days SPY was flat
+    #      to up, while realized P&L was positive — the exposure was the loss,
+    #      not the trades. Entries gate on this in ensemble.py; this is the
+    #      report-side mirror so drift is visible rather than inferred.
+    net = sum(float(p["market_value"]) for p in positions) / equity if equity else 0
+    if net > 1.15:
+        fail("WARN", "net_long_exposure",
+             f"net long {net*100:.0f}% of equity (gross {lev:.2f}x) — a flat "
+             f"tape costs money at this exposure",
+             "long entries should be gated; check the ensemble exposure gate fired")
+    elif net < -0.50:
+        fail("WARN", "net_long_exposure",
+             f"net SHORT {abs(net)*100:.0f}% of equity — unhedged downside "
+             f"reversal risk")
+
     # ── 7. Buying power must stay above the reserve or entries silently
     #      fail — 597 doomed submissions in one day.
     bp = float(acct.get("buying_power") or 0)
