@@ -74,8 +74,26 @@ class MoversAgent:
                         or vol < MIN_VOLUME):
                     continue
 
-                # Confidence: 0.60 at a 5% move, +0.02 per extra %, cap 0.80.
-                confidence = round(min(0.60 + (abs(pct) - MIN_MOVE_PCT) * 0.02, 0.80), 3)
+                # Confidence must clear the gates this signal has to pass,
+                # or the agent is decorative. MetaAgent requires 0.65 for a
+                # solo long and 0.72 for a solo short. The old curve was
+                # 0.60 + 0.02/pt capped at 0.80, which meant:
+                #     a  5% gainer scored 0.60 -> under 0.65, never bought
+                #     a 10% loser  scored 0.70 -> under 0.72, never shorted
+                # A stock down 10% on the day — exactly the move we most
+                # want to short — could not clear the bar by itself, and
+                # this agent exists precisely to act alone on names no
+                # other agent is watching.
+                #
+                # New curve: 0.66 at 5%, +0.03 per extra point, cap 0.88.
+                #     5%  -> 0.66  clears solo long
+                #     7%  -> 0.72  clears solo short
+                #    10%  -> 0.81  strong short
+                #    12%+ -> 0.87+ high conviction
+                # Risk of chasing is handled where it belongs: the falling-
+                # knife guard screens longs, and ATR stops (now uncapped to
+                # 12%) size these positions smaller because they are volatile.
+                confidence = round(min(0.66 + (abs(pct) - MIN_MOVE_PCT) * 0.03, 0.88), 3)
 
                 if direction == "long":
                     stop   = round(price * (1 - STOP_LOSS_PCT), 2)

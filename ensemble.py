@@ -697,12 +697,37 @@ class Ensemble:
                 _mult = float(_tl_cfg().get("atr_stop_mult", 1.5))
             except Exception:
                 _mult = 1.5
-            # Cap stop width at 4% of entry. Evidence 2026-07-31: the
-            # 4%+ ATR bucket held 50 trades and -$3,604 — nearly all
-            # losses — vs +$200 for 2-4%. A volatile name does not earn
-            # a wider stop, it earns a smaller position.
+            # Stop must sit OUTSIDE the symbol's noise band, with position
+            # size — not stop width — carrying the risk budget.
+            #
+            # The old cap was 4% of entry, on the principle that "a volatile
+            # name does not earn a wider stop, it earns a smaller position."
+            # The principle is right; only its first half was implemented.
+            # The stop was capped and the position was never shrunk, so
+            # volatile names got a stop planted inside their own daily range.
+            #
+            # Evidence 2026-08-12 — all five stop-outs of Aug 10-12 needed
+            # 6.4-13.5% and every one was clipped to exactly 4.0%:
+            #   ABCL ATR 7.4% -> needed 11.0%   stopped -4%, now +8.7% past entry
+            #   EROC ATR 9.0% -> needed 13.5%   stopped -4%, now +3.2% past entry
+            #   HRB  ATR 4.9% -> needed  7.3%   stopped -4%, peaked +11% past exit
+            #   FA   ATR 7.4% -> needed 11.2%
+            #   JBS  ATR 4.3% -> needed  6.4%
+            # Three of five recovered past our entry after shaking us out.
+            # That is not bad selection, it is a stop inside the noise.
+            #
+            # This does NOT widen risk: agent_risk_bridge sizes shares as
+            # dollar_risk / stop_distance, so a 12% stop buys a third of the
+            # shares a 4% stop would. Dollar risk per trade is unchanged;
+            # only the shake-out rate falls. It also pulls gross leverage
+            # down, since the same risk budget now buys less notional.
+            #
+            # The 2026-07-31 finding that the 4%+ ATR bucket lost $3,604 is
+            # not contradicted: those were full-size positions whose stops
+            # were ALSO capped at 4% — wide-ATR names sized as if quiet.
+            # This change is what that finding actually called for.
             stop_dist = max(_mult * atr, entry * 0.01)
-            stop_dist = min(stop_dist, entry * 0.04)
+            stop_dist = min(stop_dist, entry * 0.12)
             # target_price is a distant bookkeeping marker (4x stop) — the
             # real exit is the broker-side trailing stop, which is uncapped
             # on winners. Keeping the marker far out stops the ledger's

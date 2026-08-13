@@ -39,7 +39,19 @@ import trade_ledger as _ledger
 
 # ── Tuning knobs ────────────────────────────────────────────────────────────
 UNDERPERFORM_THRESHOLD = 0.20   # 20 % below ensemble avg triggers flag
-MIN_TRADES_TO_EVALUATE  = 3     # agent needs ≥ N trades before being judged
+# An agent needs ≥ N trades before its P&L means anything. Raised 3 -> 10
+# on 2026-08-12 after the rotator benched three PROFITABLE agents and
+# flagged the best one in the book:
+#   TechnicalAgent  +$2,132 over 5 trades  -> BENCHED
+#   PremarketAgent    +$444 over 6 trades  -> BENCHED
+#   CryptoAgent       +$433 over 8 trades  -> BENCHED
+#   BreakoutAgent   +$3,328 over 6 trades  -> flagged to bench
+#   NewsAgent       -$1,366 over 27 trades -> left active
+# At 3-8 trades a 5-day P&L window is noise, and the rotator was making
+# on/off decisions from it — switching off winners and keeping the one
+# agent with a statistically real loss. 10 trades is still a low bar, but
+# it is the point where a losing streak stops being a coin flip.
+MIN_TRADES_TO_EVALUATE  = 10    # agent needs ≥ N trades before being judged
 ROTATION_COOLDOWN_DAYS  = 2     # don't rotate same agent twice within N days
 
 
@@ -237,6 +249,17 @@ class AgentEvaluator:
         for st in active:
             if st.trades_20d < MIN_TRADES_TO_EVALUATE:
                 continue
+
+            # An agent that is MAKING money is not an underperformer, no
+            # matter how its 5-day window compares to the ensemble average.
+            # The comparison below is relative, so in a good week the best
+            # agent can trail a high average and get flagged — which is how
+            # BreakoutAgent (+$3,328, the top earner) came to be queued for
+            # benching on 2026-08-12. Relative weighting is the right tool
+            # for "good but not best"; switching the agent off is not.
+            if st.pnl_20d > 0:
+                continue
+
             reasons = []
 
             # 5-day window
