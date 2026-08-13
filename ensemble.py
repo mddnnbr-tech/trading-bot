@@ -726,8 +726,37 @@ class Ensemble:
             # not contradicted: those were full-size positions whose stops
             # were ALSO capped at 4% — wide-ATR names sized as if quiet.
             # This change is what that finding actually called for.
+            # REVERTED to 4% on 2026-08-12 after replay.py tested it over
+            # ~1,900 simulated trades across two regimes. Widening to 12%
+            # was wrong, and the reasoning behind it was wrong too.
+            #
+            # The premise was that a 4% stop sits inside the noise band and
+            # causes shake-outs. The noise part is true; the conclusion is
+            # not. Widening barely changes the shake-out rate but costs a
+            # lot of profit:
+            #     shake-out rate   4% -> 77%,  12% -> 75%   (2 points)
+            #     avg trade        4% -> +$89, 12% -> +$67
+            # And in the regime that decides survival, 2022 (SPY -18.6%):
+            #     4%  +$96/trade  PF 1.56
+            #     8%  +$53/trade  PF 1.32
+            #     12% +$51/trade  PF 1.36
+            # In the 2023 rally all three tie (~+$135), so the tight stop is
+            # nearly free upside and large downside insurance.
+            #
+            # Why: a tight stop buys more notional per dollar risked, so the
+            # winners that DO run pay several times more, while every loser
+            # costs the same fixed budget. Getting shaken out often is the
+            # price of that asymmetry, not evidence against it.
+            #
+            # The live observation that prompted the change — 3 of 5 stops
+            # recovered past entry on Aug 10-12 — was a five-trade sample.
+            # The replay says that recovery rate is ~77% and normal, at any
+            # stop width. Five trades could not have shown that.
+            #
+            # Gradient was monotonic (4% > 6% > 8% > 12%), so sub-4% stops
+            # are worth testing next; 4% is where the evidence currently is.
             stop_dist = max(_mult * atr, entry * 0.01)
-            stop_dist = min(stop_dist, entry * 0.12)
+            stop_dist = min(stop_dist, entry * 0.04)
             # target_price is a distant bookkeeping marker (4x stop) — the
             # real exit is the broker-side trailing stop, which is uncapped
             # on winners. Keeping the marker far out stops the ledger's
