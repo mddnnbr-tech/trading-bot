@@ -69,6 +69,9 @@ MIN_SOLO_CONFIDENCE    = 0.65   # calibrated 2026-07-17: the catalyst specialist
                                 # single-indicator noise stays blocked.
 PROFIT_WEIGHT_EXPONENT = 0.6    # power curve — top earners rewarded more
 REGIME_BOOST           = 0.25   # weight bonus for agents in their best regime
+# Penalty applied when an agent is in a regime it measurably loses in.
+# Sized just under REGIME_BOOST so aversion outweighs a coincidental boost.
+REGIME_PENALTY         = 0.35   # weight cut for agents in a regime they lose in
 MIN_TRADES_FOR_WEIGHTING = 20   # don't apply P&L weighting until we have real data
 
 # Full 12-agent roster with default weights
@@ -309,6 +312,18 @@ class MetaAgent:
             if agent_regimes & regimes:   # intersection — agent is in its sweet spot
                 weight = min(weight + REGIME_BOOST, 1.5)
                 log.debug(f"MetaAgent: regime boost for {agent_name} in {agent_regimes & regimes}")
+
+            # Regime AVERSION — the mirror of the boost. Affinity could only
+            # ever reward; there was no way to express "this agent loses
+            # money in this regime", so a measured loser kept full weight.
+            # deep_research.py over 1990-2026 found breakouts are actively
+            # negative in high volatility (-$28/trade, PF 0.85) while mean
+            # reversion is at its best there (+$140, PF 1.95). Knowing when
+            # to stand down is as valuable as knowing when to fire.
+            averse = set(s.get("regime_aversion", []))
+            if averse & regimes:
+                weight = max(weight - REGIME_PENALTY, 0.15)
+                log.debug(f"MetaAgent: regime penalty for {agent_name} in {averse & regimes}")
 
             new_conf = s["confidence"] * weight * conf_mult
             enriched = {**s, "confidence": round(new_conf, 4),

@@ -69,7 +69,14 @@ def _rsi(c: pd.Series, n: int = 14) -> pd.Series:
 
 class MeanReversionAgent:
     name            = "MeanReversionAgent"
-    regime_affinity = ["BULL", "NEUTRAL", "VOLATILE"]
+    # Canonical names from regime_detector: BULL_TREND / BEAR_TREND /
+    # HIGH_VOL / BREAKOUT / NEUTRAL. Originally written as
+    # ["BULL","NEUTRAL","VOLATILE"] — two of those three strings do not
+    # exist, so the intersection in meta_agent never matched and the agent
+    # got no regime boost at all. HIGH_VOL is where 35 years of data say it
+    # is strongest (+$140/trade, PF 1.95 vs +$85 / PF 1.63 in BULL), so
+    # that was precisely the wrong regime to be silent in.
+    regime_affinity = ["BULL_TREND", "NEUTRAL", "HIGH_VOL"]
 
     def __init__(self):
         self.watchlist = list(WATCHLIST)

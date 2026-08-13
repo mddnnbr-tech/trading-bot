@@ -50,6 +50,12 @@ class BreakoutAgent:
     def __init__(self, watchlist: list[str] | None = None):
         self.watchlist = watchlist or WATCHLIST
         self.regime_affinity = ["BREAKOUT", "BULL_TREND"]
+        # Measured over 1990-2026 (deep_research.py): breakouts LOSE money
+        # in high volatility — -$28/trade at PF 0.85 across 181 trades —
+        # and were flat-to-negative for the whole 2000-2009 decade (-$10).
+        # Mean reversion earns +$140 at PF 1.95 in that same regime, so the
+        # ensemble should lean away from breakout when vol spikes.
+        self.regime_aversion = ["HIGH_VOL"]
 
     def generate_signals(self) -> list[dict]:
         if not _YF_OK:
@@ -152,6 +158,7 @@ class BreakoutAgent:
             "expiration":      _next_friday(EXPIRY_DAYS),
             "meta_score":      confidence,
             "regime_affinity": self.regime_affinity,
+            "regime_aversion":  self.regime_aversion,
             "reasons":         factors,
             "timestamp":       datetime.now(timezone.utc).isoformat(),
         }
