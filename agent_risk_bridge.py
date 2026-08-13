@@ -37,6 +37,13 @@ log = logging.getLogger("AgentRiskBridge")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MAX_POSITION_SIZE_PCT = float(os.getenv("MAX_POSITION_SIZE_PCT", "2.0"))
+
+# Fraction of the account risked on one equity trade, i.e. what is lost if
+# the stop fills. Distinct from MAX_POSITION_SIZE_PCT, which caps NOTIONAL.
+# Conflating the two meant stop width silently set risk; see the note in
+# _compute_position_size. 0.5% (~$430 at current equity) reproduces the
+# ~$350 per-loss the book has actually been running.
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
 PAPER_TRADING         = os.getenv("PAPER_TRADING", "true").lower() == "true"
 PDT_THRESHOLD         = 25_000.0    # SEC rule: accounts < $25k have PDT limits
 MIN_CONFIDENCE        = 0.50        # lowered from 0.55 — match MetaAgent threshold
@@ -234,7 +241,25 @@ class AgentRiskBridge:
             if stop_distance <= 0 or entry <= 0:
                 return None
 
-            shares_by_risk     = dollar_risk / stop_distance
+            # dollar_risk above is derived from MAX_POSITION_SIZE_PCT, which
+            # is a NOTIONAL cap (10%) — as a risk budget that is $8,651 on an
+            # $86k account, so large that shares_by_risk never binds and the
+            # notional cap always wins. That is why every position came out
+            # the same size and every stop-out cost exactly ~$350 (4% of
+            # $8,651): stop width alone set the risk.
+            #
+            # Harmless while stops were capped at 4%. Actively dangerous now
+            # that ATR stops may reach 12% — same notional, tripled risk
+            # ($1,038 a trade). Risk budget and position cap are different
+            # quantities and need separate knobs.
+            #
+            # RISK_PER_TRADE_PCT is the real budget: 0.5% of the account
+            # (~$430), matching the ~$350 losses the book actually ran. Now a
+            # wider stop genuinely buys fewer shares, which is what the ATR
+            # change assumed all along.
+            risk_budget    = self.account_balance * (RISK_PER_TRADE_PCT / 100)
+            risk_budget    = min(risk_budget, dollar_risk)  # confidence scaling still applies
+            shares_by_risk     = risk_budget / stop_distance
             max_notional       = self.account_balance * (MAX_POSITION_SIZE_PCT / 100)
             shares_by_notional = max_notional / entry
             raw_shares         = min(shares_by_risk, shares_by_notional)
