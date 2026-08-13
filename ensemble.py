@@ -128,6 +128,7 @@ class Ensemble:
         from volatility_agent      import VolatilityAgent
         from intermarket_agent     import IntermarketAgent
         from movers_agent          import MoversAgent
+        from mean_reversion_agent import MeanReversionAgent
         from risk_agent            import RiskAgent
         from meta_agent            import MetaAgent
         from agent_risk_bridge     import AgentRiskBridge
@@ -150,6 +151,12 @@ class Ensemble:
             VolatilityAgent(),
             IntermarketAgent(),
             MoversAgent(),
+            # Added 2026-08-12. The other 15 agents are momentum, breakout,
+            # news or macro — the ensemble had no mean-reversion voice, and
+            # 22 years of replay put buy-the-dip at the TOP of the long
+            # table (PF 1.68, 19/22 years) with breakout near the bottom
+            # (PF 1.38, 15/22).
+            MeanReversionAgent(),
         ]
 
         self.risk   = RiskAgent()
