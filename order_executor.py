@@ -348,6 +348,30 @@ def widen_trails_on_survivors(min_days: float = 2.0,
             cur = float(getattr(trails[0], "trail_percent", 0) or 0)
             if abs(cur - target_pct) < 0.5:
                 continue
+
+            # RATCHET — only ever tighten. This function's docstring has
+            # claimed "ratchet" since it was written, but the code recomputed
+            # the target from the live gain and moved in BOTH directions, so
+            # a position parked on a tier boundary flipped every tick:
+            #
+            #   15:28  TRAIL GOOGL 8.0% -> 5.5%  (+4.0%)
+            #   15:29  TRAIL GOOGL 5.5% -> 8.0%  (+4.0%)
+            #   15:30  TRAIL GOOGL 8.0% -> 5.5%  (+4.0%)
+            #        ...every minute for a full session, 2026-08-13
+            #
+            # _trail_for_profit switches tiers at exactly 4%, and GOOGL sat
+            # at +4.0%, so pennies of drift toggled it. Each toggle is a
+            # cancel-then-submit, and that gap is where a position ends up
+            # with no exit order — the "N positions have NO exit order"
+            # CRITICAL has now fired four times (Aug 4: 14 positions, Aug 12:
+            # 6, Aug 13: 3). Every occurrence traces back to churn here.
+            #
+            # Loosening protection on a winner is also just wrong on its own
+            # terms: giving back room the trade already earned is the exact
+            # behaviour the progressive trail exists to prevent. Tighten as
+            # the gain grows; never hand it back.
+            if target_pct >= cur > 0:
+                continue
             widen_to_pct = target_pct
             # Cancel-then-submit is NOT atomic: if the submit fails, the
             # position is left with NO exit order at all. The invariant
