@@ -131,7 +131,23 @@ def check_all() -> list[dict]:
     # substitution is only valid while the poller is actually running —
     # checked separately below rather than assumed.
     def _is_crypto(sym): return sym.endswith("USD") and len(sym) > 5
-    protected = {o["symbol"] for o in orders}
+
+    # An order only protects a position if it CLOSES it: sell against a long,
+    # buy against a short. Matching on symbol alone treats any resting order
+    # as protection, so a wrong-side order would read as safe while the
+    # position sat naked. Today's book is clean (verified 2026-08-13: 15
+    # orders, all correct side), but the check could not have told the
+    # difference — and this rule is the last line of defence for unbounded
+    # downside, so it should not depend on that luck holding.
+    _qty = {p["symbol"]: float(p.get("qty") or 0) for p in positions}
+    protected = set()
+    for o in orders:
+        s = o["symbol"]
+        q = _qty.get(s)
+        if q is None or q == 0:
+            continue
+        if (o.get("side") == "sell") if q > 0 else (o.get("side") == "buy"):
+            protected.add(s)
     naked = [p["symbol"] for p in equities
              if p["symbol"] not in protected and not _is_crypto(p["symbol"])]
     if naked:
