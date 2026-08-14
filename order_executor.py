@@ -177,17 +177,54 @@ class OrderExecutor:
             symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
         ))
 
-        # Wait for the fill so the trailing stop isn't rejected for missing qty
+        # Wait for the fill so the trailing stop isn't rejected for missing qty.
+        #
+        # This is the source of every "position has NO exit order" CRITICAL
+        # this month (Aug 4: 14 positions, Aug 12: 6, Aug 13: 3, Aug 14: 2).
+        # Two bugs compounded:
+        #
+        #   1. status.endswith("filled") is ALSO true for "partially_filled",
+        #      so the wait broke the moment the first share printed.
+        #   2. the trail was then sized from the REQUESTED qty, not what
+        #      actually filled. Alpaca rejects the whole order:
+        #        "insufficient qty available (requested: 279, available: 181)"
+        #      — and the position is left completely unprotected.
+        #
+        # Fix: wait for a terminal state, then size the stop from what the
+        # broker actually holds. A partial fill must still be protected; a
+        # smaller stop is correct, no stop is a catastrophe.
         import time as _t
-        for _ in range(10):
+        filled_qty = 0
+        for _ in range(15):
             o = self._client.get_order_by_id(entry_order.id)
-            if str(o.status).lower().endswith("filled"):
+            st = str(o.status).lower().split(".")[-1]
+            filled_qty = int(float(getattr(o, "filled_qty", 0) or 0))
+            if st == "filled":
+                break
+            if st in ("canceled", "expired", "rejected"):
                 break
             _t.sleep(1)
 
+        # The broker's position is the authority — it also absorbs any
+        # pre-existing holding this order added to.
+        try:
+            _p = self._client.get_open_position(symbol)
+            protect_qty = abs(int(float(_p.qty)))
+        except Exception:
+            protect_qty = filled_qty
+
+        if protect_qty < 1:
+            log.error(f"{symbol}: entry did not fill (status={st}) — "
+                      f"no position to protect")
+            return {"status": "unfilled", "symbol": symbol}
+
+        if protect_qty != qty:
+            log.warning(f"{symbol}: requested {qty} but hold {protect_qty} — "
+                        f"sizing the trailing stop to the actual position")
+
         from alpaca.trading.requests import TrailingStopOrderRequest
         trail_order = self._client.submit_order(TrailingStopOrderRequest(
-            symbol=symbol, qty=qty, side=exit_side,
+            symbol=symbol, qty=protect_qty, side=exit_side,
             trail_percent=trail_pct, time_in_force=TimeInForce.GTC,
         ))
         log.info(f"🪤 TRAIL SET: {symbol} exit trails {trail_pct}% behind "
