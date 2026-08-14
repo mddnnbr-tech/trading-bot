@@ -84,28 +84,53 @@ def check_regime_vocabulary():
 
 
 def check_weight_arithmetic():
-    """An agent must still be able to clear its bar after a regime penalty.
+    """Verify how weight actually interacts with the gates.
 
-    This is the check that would have caught the short-book mute: the
-    penalty is applied to the LOWEST weight an agent can hold, and we
-    verify a maximum-confidence signal can still pass the relevant gate.
+    The first version of this check asserted that weighted confidence must
+    clear the solo bar, and reported two FAILUREs. Both were false: the
+    solo gates read RAW confidence (meta_agent lines ~190, ~207, ~248,
+    ~279, and ~280 restores raw for solo signals), so weight never blocks
+    a solo entry. Acting on that reading would have "fixed" a bug that did
+    not exist — the exact failure mode this file is meant to prevent, so
+    the check is kept honest rather than deleted.
+
+    What weight ACTUALLY controls is ranking: weighted confidence decides
+    which signals survive MAX_SIGNALS_PER_TICK. That is the real
+    suppression channel and the one worth asserting.
     """
+    import inspect
+
     import meta_agent as M
+    src = inspect.getsource(M)
+
+    # Guard the assumption itself: if solo gating ever switches to weighted
+    # confidence, the floor becomes a hard mute and this must be revisited.
+    if "raw_confidence" not in src:
+        fail("meta_agent no longer references raw_confidence — solo gates may "
+             "now use WEIGHTED confidence, in which case MIN_AGENT_WEIGHT="
+             f"{M.MIN_AGENT_WEIGHT} silently blocks every floored agent")
+        return
+
     floor = M.MIN_AGENT_WEIGHT
     worst = max(floor * (1.0 - M.REGIME_PENALTY), 0.20)
-    # Best case a real agent can produce (MoversAgent caps at 0.88).
-    for label, bar, best_conf in (("solo short", M.SOLO_SHORT_CONFIDENCE, 0.88),
-                                  ("solo long", M.MIN_SOLO_CONFIDENCE, 0.88)):
-        if best_conf * worst < bar:
-            fail(f"{label}: an agent at the weight floor under a regime "
-                 f"penalty reaches {best_conf * worst:.2f} against a "
-                 f"{bar:.2f} bar — it can NEVER fire. Penalty={M.REGIME_PENALTY}, "
-                 f"floor={floor}. This silences the sleeve entirely.")
-    # Un-penalised floor should still be able to trade.
-    if 0.88 * floor < M.MIN_SOLO_CONFIDENCE:
-        warn(f"at MIN_AGENT_WEIGHT={floor}, even a 0.88-confidence signal "
-             f"reaches {0.88 * floor:.2f} < {M.MIN_SOLO_CONFIDENCE} solo bar — "
-             f"floored agents cannot trade solo at all")
+    top = 1.15  # best weight any agent currently holds
+
+    # Ranking check: a floored+penalised agent competing against the top
+    # agent for MAX_SIGNALS_PER_TICK slots. If even a maximum-conviction
+    # signal cannot outrank a mediocre one from a favoured agent, that
+    # sleeve is effectively silent regardless of the solo bar.
+    best_from_floored = 0.88 * worst
+    mediocre_from_top = 0.66 * top
+    if best_from_floored < mediocre_from_top:
+        warn(f"ranking: a floored+penalised agent's BEST signal scores "
+             f"{best_from_floored:.2f} vs {mediocre_from_top:.2f} for a "
+             f"mediocre signal from the top-weighted agent. With "
+             f"MAX_SIGNALS_PER_TICK={M.MAX_SIGNALS_PER_TICK}, that sleeve "
+             f"rarely makes the cut even though the solo bar would admit it.")
+
+    if M.REGIME_PENALTY >= 1.0:
+        fail(f"REGIME_PENALTY={M.REGIME_PENALTY} — multiplicative penalty of "
+             f"1.0 or more zeroes the weight entirely")
 
 
 def check_exposure_gates():
