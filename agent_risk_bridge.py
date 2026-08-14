@@ -69,7 +69,18 @@ class AgentRiskBridge:
     """
 
     def __init__(self, account_balance: float | None = None):
-        self.account_balance = account_balance or float(
+        # LIVE equity, not a static config value. ACCOUNT_BALANCE in .env was
+        # set to 100,000 and never touched again; by 2026-08-14 real equity
+        # was $88,809, so every position was sized 12.6% too large and every
+        # risk figure in the logs overstated by the same amount. Position
+        # sizing that does not shrink with a drawdown is how a losing streak
+        # compounds: the account falls, the bet stays the same size, and the
+        # bet grows as a share of what is left.
+        #
+        # The broker is the authority on equity, exactly as it is for P&L.
+        # A new Ensemble is built each tick, so this refreshes every cycle.
+        # Falls back to the passed/env value only if the broker is unreachable.
+        self.account_balance = self._live_equity() or account_balance or float(
             os.getenv("ACCOUNT_BALANCE", "100000")
         )
         self._pdt_trades_today: int = 0   # incremented by caller if needed
@@ -79,6 +90,25 @@ class AgentRiskBridge:
             f"AgentRiskBridge initialized | balance=${self.account_balance:,.0f} "
             f"| tier={tier} | max_position={MAX_POSITION_SIZE_PCT}%"
         )
+
+    @staticmethod
+    def _live_equity() -> float | None:
+        """Broker equity, or None if it cannot be read this tick."""
+        try:
+            import requests
+            h = {"APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY", ""),
+                 "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET", "")}
+            r = requests.get("https://paper-api.alpaca.markets/v2/account",
+                             headers=h, timeout=10)
+            if r.status_code != 200:
+                return None
+            eq = float(r.json().get("equity") or 0)
+            # Sanity-guard the value before it drives every position size.
+            return eq if 1_000 <= eq <= 100_000_000 else None
+        except Exception as e:
+            log.warning(f"live equity unavailable ({e}) — falling back to "
+                        f"configured balance; position sizes may be stale")
+            return None
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
