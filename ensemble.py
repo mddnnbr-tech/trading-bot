@@ -72,8 +72,30 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "10"))
 # Shorts are exempt from both limits: they were the only profitable sleeve
 # (VFC +$702, FICO +$539, GME +$361, AVGO +$296, all green) and every short
 # REDUCES net exposure, so blocking them would be backwards.
-MAX_GROSS_LEVERAGE_ENTRY = float(os.getenv("MAX_GROSS_LEVERAGE_ENTRY", "1.6"))
-MAX_NET_LONG_PCT = float(os.getenv("MAX_NET_LONG_PCT", "0.85"))
+# RECALIBRATED 2026-08-14. Both numbers were set on 2026-08-12 from a naive
+# net figure of 102%, computed before exposure.py taught the code that a long
+# inverse ETF is short exposure. Under signed exposure that same book was 64%
+# net — so the 85% net gate could never bind, and the 1.60x GROSS gate silently
+# became the only active brake.
+#
+# That is the wrong brake. Gross counts both sides, so it punishes hedging: on
+# 2026-08-14 the book was 60% net long ($107,740 long against $55,125 short,
+# 34% hedged) with $53,805 buying power — directionally safer than the days
+# that lost money — yet every entry was rejected at 1.85x gross. Combined with
+# short agents being suppressed in a bull tape, the bot deadlocked: 86 signals
+# a tick, zero entries possible from either side.
+#
+# Net long is what actually predicted the losses, so it is the binding gate;
+# gross becomes a margin/liquidity backstop, still well under the 2.5x
+# invariant ceiling.
+#
+# HONEST CAVEAT: these levels are judgment, not measured optima. The losing
+# days sat at 60-64% signed net, which is where the book sits now, so a net
+# gate that would have stopped them would also stop most normal trading. What
+# is needed is an exposure sweep in replay.py — the same treatment that
+# corrected the ATR stop — rather than another number picked by argument.
+MAX_GROSS_LEVERAGE_ENTRY = float(os.getenv("MAX_GROSS_LEVERAGE_ENTRY", "2.0"))
+MAX_NET_LONG_PCT = float(os.getenv("MAX_NET_LONG_PCT", "0.70"))
 
 # Hard cap on the learner's blacklist. Guards against the failure found
 # 2026-07-30: a learner trained on corrupted-era data blacklisted 40

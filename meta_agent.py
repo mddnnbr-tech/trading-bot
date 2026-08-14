@@ -320,9 +320,15 @@ class MetaAgent:
             # negative in high volatility (-$28/trade, PF 0.85) while mean
             # reversion is at its best there (+$140, PF 1.95). Knowing when
             # to stand down is as valuable as knowing when to fire.
+            # Multiplicative, not subtractive. Subtracting 0.35 from agents
+            # already sitting on the 0.40 MIN_AGENT_WEIGHT floor drove them
+            # to 0.15, so on 2026-08-14 no short could clear the 0.72 solo
+            # bar and the short book went completely silent in a bull tape —
+            # a lean became a total mute. Scaling preserves the ordering
+            # between agents at any weight level.
             averse = set(s.get("regime_aversion", []))
             if averse & regimes:
-                weight = max(weight - REGIME_PENALTY, 0.15)
+                weight = max(weight * (1.0 - REGIME_PENALTY), 0.20)
                 log.debug(f"MetaAgent: regime penalty for {agent_name} in {averse & regimes}")
 
             new_conf = s["confidence"] * weight * conf_mult
