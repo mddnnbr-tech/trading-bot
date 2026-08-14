@@ -50,6 +50,23 @@ class ShortMomentumAgent:
     def __init__(self, watchlist: list[str] | None = None):
         self.watchlist = watchlist or WATCHLIST
         self.regime_affinity = ["BEAR_TREND", "HIGH_VOL"]
+        # Shorting is a REGIME trade, not a permanent stance. Measured over
+        # 1990-2026 (short_research.py, 53 symbols, 481,922 symbol-days):
+        #
+        #                        BULL            BEAR           HIGH_VOL
+        #   short_below_200   -$18 PF 0.89   +$27 PF 1.16    +$30 PF 1.16
+        #   short_breakdown   -$12 PF 0.93   +$43 PF 1.26    +$46 PF 1.24
+        #   short_death_cross -$11 PF 0.93   +$35 PF 1.20    +$25 PF 1.13
+        #
+        # By decade every short rule earned in 2000-2009 (two bear markets)
+        # and lost in the 1990s, 2010s and 2020s. Affinity already boosted
+        # these agents in BEAR/HIGH_VOL, but nothing held them back in a
+        # bull tape — so they shorted into strength all year and paid for it.
+        #
+        # Survivorship bias runs AGAINST shorts here (Enron, Lehman, Nortel
+        # and the dot-com casualties are absent from a 2026 survivor list),
+        # so these are a floor. The regime split is the robust part.
+        self.regime_aversion = ["BULL_TREND"]
 
     def generate_signals(self) -> list[dict]:
         if not _YF_OK:
@@ -148,6 +165,7 @@ class ShortMomentumAgent:
             "expiration":      _next_friday(EXPIRY_DAYS),
             "meta_score":      confidence,
             "regime_affinity": self.regime_affinity,
+            "regime_aversion":  self.regime_aversion,
             "reasons":         factors,
             "timestamp":       datetime.now(timezone.utc).isoformat(),
         }
