@@ -95,7 +95,16 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "10"))
 # is needed is an exposure sweep in replay.py — the same treatment that
 # corrected the ATR stop — rather than another number picked by argument.
 MAX_GROSS_LEVERAGE_ENTRY = float(os.getenv("MAX_GROSS_LEVERAGE_ENTRY", "2.0"))
-MAX_NET_LONG_PCT = float(os.getenv("MAX_NET_LONG_PCT", "0.70"))
+# MEASURED 2026-08-14 by portfolio_backtest.py (2005-2026, 53 symbols,
+# ~9,900 trades per config). Net-long tightness is monotonic in the OPPOSITE
+# direction to my reasoning this morning:
+#     net 50%  Sharpe 0.13   CAGR 0.8%
+#     net 70%  Sharpe 0.15   CAGR 1.2%   <- what I shipped, and it was wrong
+#     net 85%  Sharpe 0.32   CAGR 4.1%
+#     net 100% Sharpe 0.32   CAGR 4.2%
+# Squeezing net long starves the book of the winners that pay for the losers.
+# 0.85 sits at the plateau; 1.00 buys nothing more and gives up the brake.
+MAX_NET_LONG_PCT = float(os.getenv("MAX_NET_LONG_PCT", "0.85"))
 
 # Hard cap on the learner's blacklist. Guards against the failure found
 # 2026-07-30: a learner trained on corrupted-era data blacklisted 40
@@ -297,6 +306,20 @@ class Ensemble:
         # already carrying too much directional risk, while leaving shorts
         # free (they cut net exposure rather than add to it). Read from the
         # broker, never the ledger — the ledger has been wrong four times.
+        # Shorts only in BEAR / HIGH_VOL. Measured 2026-08-14 — the biggest
+        # single lever in the whole sweep:
+        #     shorts in bear only  $597,523  CAGR 9.0%  Sharpe 0.63
+        #     long only            $371,664  CAGR 6.5%  Sharpe 0.55
+        #     shorts always on     $127,717  CAGR 1.2%  Sharpe 0.15
+        # Shorting into a bull tape was destroying more than the short book
+        # ever earned; long-only beat always-short by 3x. This was already a
+        # soft weight penalty via regime_aversion, but the backtest models a
+        # HARD gate and the gap is far too large to leave to weighting.
+        _bearish = bool(regimes & {"BEAR_TREND", "HIGH_VOL"})
+        block_shorts = "" if _bearish else "bull tape — shorts only in BEAR/HIGH_VOL"
+        if block_shorts:
+            log.info(f"📈 Short entries blocked — {block_shorts}")
+
         block_longs = ""
         try:
             from order_executor import get_executor
@@ -425,9 +448,14 @@ class Ensemble:
                              f"— on learner's avoid list (persistent loser)")
                     continue
 
-                if block_longs and str(signal.get("direction", "")).lower() != "short":
+                _is_short = str(signal.get("direction", "")).lower() == "short"
+                if block_longs and not _is_short:
                     log.info(f"📉 SKIPPED: {signal['symbol']:6} {signal['direction']:5} "
                              f"— {block_longs}")
+                    continue
+                if block_shorts and _is_short:
+                    log.info(f"📈 SKIPPED: {signal['symbol']:6} {signal['direction']:5} "
+                             f"— {block_shorts}")
                     continue
 
                 signal = self._normalize_geometry(signal)
