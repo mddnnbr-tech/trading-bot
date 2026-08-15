@@ -43,7 +43,16 @@ ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "16000"))
 # mandate (2026-07-15): 3-4 big high-conviction trades a day, not a stream
 # of small ones — Jul 13 alone opened 15 positions under per-tick caps,
 # which is exactly the bleed pattern the clean-epoch data convicted.
-DAILY_TRADE_CAP = int(os.getenv("DAILY_TRADE_CAP", "4"))
+# MEASURED 2026-08-14 (verify_combined.py, 2005-2026). Fewer entries per
+# day is strictly better, and the gradient is steep:
+#     cap 3   Sharpe 0.85   CAGR 8.3%   maxDD -18.9%
+#     cap 5   Sharpe 0.71   CAGR 7.8%   maxDD -23.3%
+#     cap 10  Sharpe 0.60   CAGR 7.4%   maxDD -27.9%
+# Every extra daily slot is filled by a worse candidate: the ranking already
+# put the best setups first, so widening the cap only buys marginal signals
+# while adding correlated same-day exposure. 3 is both the highest Sharpe
+# and the shallowest drawdown in the sweep.
+DAILY_TRADE_CAP = int(os.getenv("DAILY_TRADE_CAP", "3"))
 
 # Runaway circuit breaker only — entries are gated at 3x this, NOT at this
 # value (changed 2026-08-07). History: 8 entries/day stacked 25 open
