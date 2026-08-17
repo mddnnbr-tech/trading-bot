@@ -113,7 +113,15 @@ MAX_GROSS_LEVERAGE_ENTRY = float(os.getenv("MAX_GROSS_LEVERAGE_ENTRY", "2.0"))
 #     net 100% Sharpe 0.32   CAGR 4.2%
 # Squeezing net long starves the book of the winners that pay for the losers.
 # 0.85 sits at the plateau; 1.00 buys nothing more and gives up the brake.
-MAX_NET_LONG_PCT = float(os.getenv("MAX_NET_LONG_PCT", "0.85"))
+# FINAL 2026-08-15 (final_sweep.py, 2005-2026, shorts gated + cap 3):
+#     net 85%  pos5   Sharpe 0.84  CAGR 8.2%   maxDD -18.9%
+#     net 100% pos5   Sharpe 0.89  CAGR 9.3%   maxDD -19.8%
+#     net 100% pos10  Sharpe 0.79  CAGR 11.7%  maxDD -30.4%   <- chosen
+# Only net100/pos10 beats SPY on BOTH raw return (11.7% vs 10.9% CAGR) and
+# drawdown (-30.4% vs ~-55%), which is the stated objective: outperform in
+# good markets and bad. net100 still brakes — it blocks adding beyond 100%
+# net long — it simply stops strangling the book at 70-85%.
+MAX_NET_LONG_PCT = float(os.getenv("MAX_NET_LONG_PCT", "1.00"))
 
 # Hard cap on the learner's blacklist. Guards against the failure found
 # 2026-07-30: a learner trained on corrupted-era data blacklisted 40
