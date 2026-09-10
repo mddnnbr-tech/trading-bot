@@ -71,10 +71,10 @@ GMAIL_ADDRESS   = os.getenv("GMAIL_ADDRESS", "")
 GMAIL_APP_PW    = os.getenv("GMAIL_APP_PASSWORD", "")
 REPORT_TO_EMAIL = os.getenv("REPORT_TO_EMAIL", GMAIL_ADDRESS)
 
-# Trading mode — drives whether PAPER or LIVE column is the "active" one in the report.
-# Defaults to PAPER when PAPER_TRADING is true (or unset). Override with TRADING_MODE=live.
-_PAPER_FLAG = os.getenv("PAPER_TRADING", "true").strip().lower() in ("1", "true", "yes")
-TRADING_MODE = os.getenv("TRADING_MODE", "paper" if _PAPER_FLAG else "live").strip().lower()
+# This bot is paper-only. TRADING_MODE=live / PAPER_TRADING=false cannot
+# flip the report into a live column — that is how a paper loss got
+# misread as a live one.
+TRADING_MODE = "paper"
 
 APPROVED_EVENTS = {"SIGNAL_APPROVED", "approved", "APPROVED"}
 REJECTED_EVENTS = {"SIGNAL_REJECTED", "rejected", "REJECTED"}
@@ -131,12 +131,16 @@ def read_scheduler_today() -> dict:
         "last_log":  None,
         "tick_count": 0,
         "error_count": 0,
+        "fetch_error_count": 0,
+        "system_error_count": 0,
         "fetch_404_symbols": defaultdict(int),
         "raw_signal_ticks": [],     # list of (time_str, total_count)
         "synthesis_events": [],     # list of (time_str, raw, passed)
         "approved_batches": [],     # list of (time_str, count)
         "agent_signal_counts": defaultdict(int),  # cumulative across all today's ticks
         "regime_observations": [],  # list of regime strings observed
+        "rejected_log_count": 0,
+        "gate_events": defaultdict(int),
     }
     if not path.exists():
         return result
@@ -156,11 +160,19 @@ def read_scheduler_today() -> dict:
 
     re_404_sym = re.compile(r"symbol:\s*([A-Z][A-Z0-9\-]*)")
     re_short_404 = re.compile(r"\[ERROR\]\s+([A-Z][A-Z0-9\-]*):\s*No earnings")
-    re_raw_signals = re.compile(r"Total raw signals from all agents:\s*(\d+)")
-    re_synthesis = re.compile(r"(\d+)\s+raw signals\s*→\s*(\d+)\s+passed synthesis")
+    # Current ensemble.py logs "Total raw signals: N". The old
+    # ensemble_v11 line "Total raw signals from all agents:" is still
+    # accepted so a mixed log after deploy still parses.
+    re_raw_signals = re.compile(r"Total raw signals(?: from all agents)?:\s*(\d+)")
+    re_synthesis = re.compile(
+        r"(?:MetaAgent:\s*)?(\d+)\s+raw signals?\s*→\s*(\d+)\s+passed synthesis"
+        r"|── Cycle:\s*(\d+)\s+raw\s*→\s*(\d+)\s+synthesized"
+    )
     re_approved_batch = re.compile(r"Tick produced\s+(\d+)\s+approved signal")
     re_agent_count = re.compile(r"(\w+Agent):\s*(\d+)\s*signal")
     re_regime = re.compile(r"active regimes\s*=\s*\{([^}]+)\}")
+    re_rejected = re.compile(r"(?:REJECTED|SKIPPED):\s+([A-Z][A-Z0-9\.\-]*)\s+")
+    re_gate = re.compile(r"(Long entries blocked|Short entries blocked|Daily trade cap reached|GATE DEADLOCK|NAKED POSITIONS)")
 
     for line in today_lines:
         time_str = line[11:19] if len(line) > 19 else ""
@@ -170,6 +182,10 @@ def read_scheduler_today() -> dict:
             m = re_404_sym.search(line) or re_short_404.search(line)
             if m:
                 result["fetch_404_symbols"][m.group(1)] += 1
+            if _is_fetch_error(line):
+                result["fetch_error_count"] += 1
+            else:
+                result["system_error_count"] += 1
 
         if "Ensemble cycle start" in line:
             result["tick_count"] += 1
@@ -180,7 +196,10 @@ def read_scheduler_today() -> dict:
 
         m = re_synthesis.search(line)
         if m:
-            result["synthesis_events"].append((time_str, int(m.group(1)), int(m.group(2))))
+            raw = m.group(1) or m.group(3)
+            passed = m.group(2) or m.group(4)
+            if raw is not None and passed is not None:
+                result["synthesis_events"].append((time_str, int(raw), int(passed)))
 
         m = re_approved_batch.search(line)
         if m:
@@ -194,7 +213,21 @@ def read_scheduler_today() -> dict:
         if m:
             result["regime_observations"].append(m.group(1).strip())
 
+        if re_rejected.search(line) or "⛔ REJECTED" in line or "SKIPPED:" in line:
+            result["rejected_log_count"] += 1
+        g = re_gate.search(line)
+        if g:
+            result["gate_events"][g.group(1)] += 1
+
     return result
+
+
+def _is_fetch_error(line: str) -> bool:
+    low = line.lower()
+    return any(tok in low for tok in (
+        "404", "yfinance", "http error", "no earnings", "timed out",
+        "timeout", "rate limit", "too many requests",
+    ))
 
 
 def _empty_pnl_summary(note: str = "") -> dict:
@@ -361,16 +394,46 @@ def diagnose(report: dict) -> list[str]:
             f"Check `tail -200 scheduler.log` for stuck imports/timeouts."
         )
 
-    if sched["error_count"] > 100:
-        top_404 = sorted(sched["fetch_404_symbols"].items(), key=lambda x: -x[1])[:5]
-        top_str = ", ".join(f"{s} ({n}×)" for s, n in top_404)
+    if sched.get("system_error_count", 0) > 20:
         findings.append(
-            f"⚠️  {sched['error_count']} errors today, mostly yfinance 404s. "
-            f"Worst offenders: {top_str}. EarningsAgent likely querying ETFs/crypto "
-            f"that don't have earnings — blacklist them from its universe."
+            f"⚠️  {sched['system_error_count']} SYSTEM errors today "
+            f"(plus {sched.get('fetch_error_count', 0)} fetch/404s). "
+            f"Fetch errors are noise; system errors are the ones that "
+            f"break ticks. Check `grep '\\[ERROR\\]' logs/scheduler.log`."
+        )
+    elif sched.get("fetch_error_count", 0) > 50:
+        top_404 = sorted(sched["fetch_404_symbols"].items(), key=lambda x: -x[1])[:5]
+        top_str = ", ".join(f"{s} ({n}×)" for s, n in top_404) or "n/a"
+        findings.append(
+            f"ℹ️  {sched['fetch_error_count']} fetch/404 errors today "
+            f"(not counted as a health failure). Worst: {top_str}."
         )
 
-    # (removed: this compared against trade_log.jsonl, a dead source)
+    gates = sched.get("gate_events") or {}
+    if gates.get("GATE DEADLOCK"):
+        findings.append(
+            "⚠️  Entry gates deadlocked (longs AND shorts blocked) — "
+            "zero new trades were possible. Check gross/net exposure."
+        )
+    if gates.get("NAKED POSITIONS"):
+        findings.append(
+            "⚠️  CRITICAL: naked-position kill-switch fired — new entries "
+            "were blocked until trailing stops could be re-armed."
+        )
+    if report["approved_count"] == 0 and report.get("raw_signals_total", 0) > 0:
+        reasons = []
+        if gates.get("Daily trade cap reached"):
+            reasons.append("daily trade cap")
+        if gates.get("Long entries blocked"):
+            reasons.append("longs blocked by exposure")
+        if gates.get("Short entries blocked"):
+            reasons.append("shorts blocked (bull tape)")
+        extra = f" Likely cause: {', '.join(reasons)}." if reasons else ""
+        findings.append(
+            f"ℹ️  Agents produced signals (peak {report['raw_signals_total']} raw) "
+            f"but none were approved.{extra} "
+            f"This is not a silent bot — it is gated."
+        )
 
     if report["approved_count"] == 0 and report["rejected_count"] > 0:
         # Check rejection reasons for tier confidence patterns
@@ -576,8 +639,8 @@ class DailyReporter:
             "generated_at":         now.strftime("%Y-%m-%d %H:%M ET"),
             "trading_mode":         TRADING_MODE,
             "sched":                sched,
-            "approved_count":       len(approved),
-            "rejected_count":       len(rejected),
+            "approved_count":       len(approved_trades),
+            "rejected_count":       sched.get("rejected_log_count", 0),
             "approved_trades":      approved_trades,
             "total_notional":       round(total_notional, 2),
             "rejection_reasons":    rejection_reasons,
@@ -1183,8 +1246,10 @@ class DailyReporter:
         # Findings panel (top of email — most important)
         findings_html = ""
         for f in d["findings"]:
-            bg = "#fef2f2" if f.startswith("⚠️") else ("#fffbeb" if f.startswith("💡") else
-                  "#f0fdf4" if f.startswith("✅") else "#f1f5f9")
+            bg = "#fef2f2" if f.startswith("⚠️") else (
+                "#eff6ff" if f.startswith("ℹ️") else (
+                "#fffbeb" if f.startswith("💡") else
+                "#f0fdf4" if f.startswith("✅") else "#f1f5f9"))
             findings_html += f'<div style="background:{bg};padding:10px 14px;border-radius:6px;margin-bottom:6px;font-size:13px">{f}</div>'
 
         # Approved trades table
@@ -1247,13 +1312,13 @@ class DailyReporter:
             f'<tr><td style="padding:6px 10px;font-weight:600">Ticks observed</td>'
             f'<td style="padding:6px 10px;text-align:right;color:{tick_color};font-weight:700">{sched["tick_count"]:,} / ~390 ({tick_pct:.0f}%)</td></tr>'
             f'<tr><td style="padding:6px 10px;font-weight:600">First log entry</td>'
-            f'<td style="padding:6px 10px;text-align:right;font-family:monospace;font-size:12px">{sched["first_log"] or "—"}</td></tr>'
+            f'<td style="padding:6px 10px;text-align:right;font-family:monospace;font-size:12px">{sched.get("first_log") or "—"}</td></tr>'
             f'<tr><td style="padding:6px 10px;font-weight:600">Last log entry</td>'
-            f'<td style="padding:6px 10px;text-align:right;font-family:monospace;font-size:12px">{sched["last_log"] or "—"}</td></tr>'
+            f'<td style="padding:6px 10px;text-align:right;font-family:monospace;font-size:12px">{sched.get("last_log") or "—"}</td></tr>'
             f'<tr><td style="padding:6px 10px;font-weight:600">Raw signals (peak tick)</td>'
-            f'<td style="padding:6px 10px;text-align:right;font-weight:700">{d["raw_signals_total"]}</td></tr>'
+            f'<td style="padding:6px 10px;text-align:right;font-weight:700">{d.get("raw_signals_total", 0)}</td></tr>'
             f'<tr><td style="padding:6px 10px;font-weight:600">Passed synthesis (peak)</td>'
-            f'<td style="padding:6px 10px;text-align:right;font-weight:700">{d["passed_synthesis"]}</td></tr>'
+            f'<td style="padding:6px 10px;text-align:right;font-weight:700">{d.get("passed_synthesis", 0)}</td></tr>'
             f'</tbody></table>'
         )
 
@@ -1270,6 +1335,9 @@ class DailyReporter:
   .header {{ background:#0f172a; padding:28px 32px; }}
   .header h1 {{ color:#fff; margin:0; font-size:20px; font-weight:700; }}
   .header p  {{ color:#94a3b8; margin:4px 0 0; font-size:13px; }}
+  .paper-banner {{ background:#1d4ed8; color:#fff; text-align:center;
+                   font-size:13px; font-weight:700; letter-spacing:.08em;
+                   padding:10px 16px; text-transform:uppercase; }}
   .body {{ padding:24px 32px; }}
   .kpi-row {{ display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap; }}
   .kpi {{ flex:1; min-width:110px; background:#f1f5f9; border-radius:8px;
@@ -1283,26 +1351,28 @@ class DailyReporter:
              color:#94a3b8; text-align:center; }}
 </style></head><body>
 <div class="wrapper">
+  <div class="paper-banner">PAPER TRADING — Alpaca paper account — not live</div>
   <div class="header">
-    <h1>📊 Daily Trading Report — v2.2</h1>
-    <p>{d['date_display']}  •  Generated {d['generated_at']}  •  Mode: <strong style="color:#fff">{d['trading_mode'].upper()}</strong></p>
+    <h1>📊 BluSterling Daily Report</h1>
+    <p>{d['date_display']}  •  Generated {d['generated_at']}  •  Mode: <strong style="color:#93c5fd">PAPER</strong></p>
   </div>
   <div class="body">
-
+    {findings_html}
     {self._format_intelligence_section(d)}
 
     <div class="section-title">⏱  System Health</div>
     <p style="font-size:13px;color:#475569;margin:0">
-      Ticks: {sched['tick_count']:,} / ~390 &nbsp;•&nbsp; Errors: {sched['error_count']:,}
-      &nbsp;•&nbsp; Signals: {d['approved_count']}✓ / {d['rejected_count']}✗
-      &nbsp;•&nbsp; Last log: {sched['last_log'] or '—'}
+      Ticks: {sched['tick_count']:,} / ~390 &nbsp;•&nbsp;
+      System errors: {sched.get('system_error_count', 0):,} &nbsp;•&nbsp;
+      Fetch/404s: {sched.get('fetch_error_count', 0):,}
+      &nbsp;•&nbsp; Entries today: {d['approved_count']}
+      &nbsp;•&nbsp; Peak raw signals: {d.get('raw_signals_total', 0)}
+      &nbsp;•&nbsp; Last log: {sched["last_log"] or "—"}
     </p>
   </div>
   <div class="footer">
-    Trading Bot Daily Report v2.2 • Paper Trading (Phase D) • Auto-generated.<br>
-    Truth sources: data/paper_trades.csv (ledger) + scheduler.log + yfinance.<br>
-    Money figures come from report_data.snapshot() (broker); the ledger
-    supplies attribution only.
+    BluSterling &amp; Associates LLC • PAPER TRADING only. Live trading is not enabled.<br>
+    Money: Alpaca paper broker via report_data.snapshot(). Ledger is attribution only.
   </div>
 </div></body></html>"""
 
@@ -1313,7 +1383,9 @@ class DailyReporter:
             print("ERROR: GMAIL_ADDRESS or GMAIL_APP_PASSWORD not set in .env")
             return False
         now = _today_et()
-        subject = subject or f"Trading Bot — Daily Report v2 ({now.strftime('%b %-d, %Y')})"
+        subject = subject or (
+            f"[PAPER] BluSterling Daily — {now.strftime('%b %-d, %Y')}"
+        )
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"]    = GMAIL_ADDRESS

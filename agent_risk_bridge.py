@@ -44,7 +44,7 @@ MAX_POSITION_SIZE_PCT = float(os.getenv("MAX_POSITION_SIZE_PCT", "2.0"))
 # _compute_position_size. 0.5% (~$430 at current equity) reproduces the
 # ~$350 per-loss the book has actually been running.
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
-PAPER_TRADING         = os.getenv("PAPER_TRADING", "true").lower() == "true"
+PAPER_TRADING         = True   # live trading is not wired; env cannot enable it
 PDT_THRESHOLD         = 25_000.0    # SEC rule: accounts < $25k have PDT limits
 MIN_CONFIDENCE        = 0.50        # lowered from 0.55 — match MetaAgent threshold
 MAX_OPTION_PREMIUM    = 5.00        # default max option premium (per contract) if not provided

@@ -172,7 +172,39 @@ def check_broker_ledger_drift() -> list[str]:
         return [f"WARNING: could not check broker/ledger drift ({e})"]
 
 
-def check_email_auth() -> list[str]:
+def check_paper_only() -> list[str]:
+    from invariants import paper_only_violation
+    msg = paper_only_violation()
+    return [f"CRITICAL: {msg}"] if msg else []
+
+
+def check_unprotected_and_heal() -> list[str]:
+    """Re-arm missing exits and close ledger ghosts. Alert only if still broken."""
+    issues: list[str] = []
+    try:
+        from order_executor import ensure_protective_exits
+        result = ensure_protective_exits()
+        leftover = result.get("still_naked") or []
+        if leftover:
+            issues.append(
+                f"CRITICAL: {len(leftover)} position(s) still have NO exit order "
+                f"after backstop: {', '.join(leftover[:8])}"
+            )
+        elif result.get("protected"):
+            issues.append(
+                f"AUTO-FIXED: re-armed trailing stops on "
+                f"{', '.join(result['protected'][:8])}"
+            )
+    except Exception as e:
+        issues.append(f"WARNING: exit backstop failed ({e})")
+    try:
+        import trade_ledger as _ledger
+        g = _ledger.close_ghosts()
+        if g.get("closed"):
+            issues.append(f"AUTO-FIXED: closed {g['closed']} ghost ledger row(s)")
+    except Exception as e:
+        issues.append(f"WARNING: ghost close failed ({e})")
+    return issues
     """Verify Gmail SMTP creds actually authenticate (cheap, no email sent)."""
     if not GMAIL_ADDRESS or not GMAIL_APP_PW:
         return ["WARNING: GMAIL_ADDRESS or GMAIL_APP_PASSWORD not set — daily/weekly emails will silently fail"]
@@ -246,10 +278,12 @@ def _should_alert(issues: list[str]) -> bool:
 def main():
     issues: list[str] = []
     issues += check_and_fix_env_duplicates()
+    issues += check_paper_only()
     issues += check_bot_alive()
     issues += check_duplicate_positions()
     issues += check_ledger_fresh()
     issues += check_broker_ledger_drift()
+    issues += check_unprotected_and_heal()
     issues += check_email_auth()
 
     if issues:

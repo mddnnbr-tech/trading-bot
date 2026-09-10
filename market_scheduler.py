@@ -111,6 +111,13 @@ def run_agent_tick():
     """Execute one full ensemble cycle: signals → risk bridge → paper/live orders."""
     now = datetime.now(ET)
     log.debug(f"Agent tick at {now.strftime('%H:%M:%S ET')}")
+    # Protection is independent of signal generation. If the ensemble
+    # throws, trailing stops still have to be on.
+    try:
+        from order_executor import ensure_protective_exits
+        ensure_protective_exits()
+    except Exception as pe:
+        log.error(f"Exit backstop failed: {pe}")
     try:
         # Also refresh open positions in the ledger every 5 minutes
         if now.minute % 5 == 0:
@@ -120,6 +127,12 @@ def run_agent_tick():
                 log.debug(f"Ledger refresh: {result}")
             except Exception as le:
                 log.debug(f"Ledger refresh failed: {le}")
+        else:
+            try:
+                import trade_ledger as _ledger
+                _ledger.close_ghosts()
+            except Exception:
+                pass
 
         from ensemble import run_ensemble
         approved = run_ensemble()
@@ -185,7 +198,9 @@ def post_daily_slack_summary():
         status_icon = "✅" if errors_today < 10 else "⚠️"
 
         lines = [
-            f"{status_icon} *BluSterling Daily Summary — {datetime.now(ET).strftime('%a %b %d, %Y')}*",
+            f"{status_icon} *BluSterling Daily Summary — PAPER — {datetime.now(ET).strftime('%a %b %d, %Y')}*",
+            f"",
+            f"_Paper trading only. These are not live fills._",
             f"",
             f"{pnl_emoji} *Total P&L: {pnl_sign}${pnl_total:,.2f}*  _(realized: {'+' if realized>=0 else ''}${realized:,.2f} | open: {'+' if unrealized>=0 else ''}${unrealized:,.2f})_",
             f"• Trades today: *{total_trades}*  ({wins}W / {losses}L closed, {open_count} still open)",

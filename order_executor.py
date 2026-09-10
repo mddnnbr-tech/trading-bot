@@ -46,17 +46,29 @@ except ImportError:
     log.warning("alpaca-py not installed — orders will be logged only, not submitted")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PAPER_TRADING     = os.getenv("PAPER_TRADING", "true").lower() == "true"
+# PAPER ONLY. Live trading is not wired; env flags cannot enable it.
+# TradingClient is always constructed with paper=True regardless of env.
+from invariants import paper_only_violation, naked_equity_symbols, is_crypto_symbol, is_option_symbol
+
+_paper_violation = paper_only_violation()
+if _paper_violation:
+    log.critical(_paper_violation)
+PAPER_TRADING     = True
 ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY", "")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 RISK_PER_TRADE    = float(os.getenv("RISK_PER_TRADE", "320"))
 MAX_POSITION_PCT  = float(os.getenv("MAX_POSITION_PCT", "2.0"))   # % of portfolio
+DEFAULT_TRAIL_PCT = 4.0   # matches the ATR stop cap used at entry
+PROTECT_RETRY_SEC = 120   # don't hammer Alpaca on a symbol that just rejected
 
 # Symbols Alpaca handles as crypto (use notional sizing, no bracket)
 CRYPTO_SYMBOLS = {"BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD", "LTC/USD"}
 
 # Max portfolio allocation per single position ($100k * 2% = $2k default)
 PORTFOLIO_VALUE   = float(os.getenv("ACCOUNT_BALANCE", "100000"))
+
+# Per-symbol last-failed timestamp for the tick-level exit backstop.
+_protect_failed_at: dict[str, float] = {}
 
 
 class OrderExecutor:
@@ -81,12 +93,14 @@ class OrderExecutor:
             log.error("ALPACA_API_KEY / ALPACA_API_SECRET not set — cannot submit orders")
             self._client = None
             return
+        # Always the paper endpoint. PAPER_TRADING=false / TRADING_MODE=live
+        # used to flip this to live — that path is hard-disabled.
         self._client = TradingClient(
             api_key=ALPACA_API_KEY,
             secret_key=ALPACA_API_SECRET,
-            paper=PAPER_TRADING,
+            paper=True,
         )
-        log.info(f"OrderExecutor ready — paper={PAPER_TRADING}")
+        log.info("OrderExecutor ready — paper=True (live trading is not enabled)")
 
     # ── Public entry point ─────────────────────────────────────────────────────
     def execute(self, approved_signal: dict) -> dict:
@@ -113,6 +127,8 @@ class OrderExecutor:
         pos_usd   = float(sizing.get("total_cost") or approved_signal.get(
                           "position_size_usd", PORTFOLIO_VALUE * MAX_POSITION_PCT / 100))
 
+        if paper_only_violation():
+            return self._reject(paper_only_violation())
         if entry <= 0:
             return self._reject("entry_price is 0 or missing")
         if stop <= 0 or target <= 0:
@@ -222,24 +238,30 @@ class OrderExecutor:
             log.warning(f"{symbol}: requested {qty} but hold {protect_qty} — "
                         f"sizing the trailing stop to the actual position")
 
-        from alpaca.trading.requests import TrailingStopOrderRequest
-        trail_order = self._client.submit_order(TrailingStopOrderRequest(
-            symbol=symbol, qty=protect_qty, side=exit_side,
-            trail_percent=trail_pct, time_in_force=TimeInForce.GTC,
-        ))
-        log.info(f"🪤 TRAIL SET: {symbol} exit trails {trail_pct}% behind "
-                 f"high-water mark (order {trail_order.id}) — upside uncapped")
+        trail_order, trail_err = _submit_trail_with_retry(
+            self._client, symbol, protect_qty, exit_side, trail_pct
+        )
+        if trail_order is None:
+            # Entry filled. Ledger must still record it. The tick-level
+            # backstop (ensure_protective_exits) retries every minute —
+            # returning "submitted" here is what lets it see the position.
+            log.critical(f"{symbol}: UNPROTECTED after fill — trail failed "
+                         f"({trail_err}); tick backstop will retry")
+        else:
+            log.info(f"🪤 TRAIL SET: {symbol} exit trails {trail_pct}% behind "
+                     f"high-water mark (order {trail_order.id}) — upside uncapped")
 
         return {
             "status":       "submitted",
             "order_id":     str(entry_order.id),
             "symbol":       symbol,
             "direction":    direction,
-            "qty":          qty,
+            "qty":          protect_qty,
             "entry":        entry,
             "stop":         stop,
             "target":       target,       # bookkeeping marker only — real exit is the trail
             "trail_percent": trail_pct,
+            "protected":    trail_order is not None,
         }
 
     # ── Crypto market order ───────────────────────────────────────────────────
@@ -308,6 +330,127 @@ class OrderExecutor:
             )
         except Exception as e:
             log.warning(f"Could not record to trade_ledger: {e}")
+
+
+def _order_qty(qty) -> int | float:
+    """Whole shares as int; otherwise the float Alpaca will accept."""
+    q = abs(float(qty or 0))
+    if q <= 0:
+        return 0
+    if abs(q - round(q)) < 1e-8:
+        return int(round(q))
+    return q
+
+
+def _submit_trail_with_retry(client, symbol: str, qty, exit_side, trail_pct: float,
+                             attempts: int = 3):
+    """Submit a GTC trailing stop, retrying after a qty refresh.
+
+    Returns (order, error). Never raises — the caller decides whether the
+    entry is still worth recording.
+    """
+    from alpaca.trading.requests import TrailingStopOrderRequest
+    from alpaca.trading.enums import TimeInForce
+    last_err = None
+    protect_qty = _order_qty(qty)
+    if protect_qty == 0:
+        return None, "qty=0"
+    import time as _t
+    for attempt in range(attempts):
+        try:
+            order = client.submit_order(TrailingStopOrderRequest(
+                symbol=symbol, qty=protect_qty, side=exit_side,
+                trail_percent=trail_pct, time_in_force=TimeInForce.GTC,
+            ))
+            return order, None
+        except Exception as e:
+            last_err = e
+            log.warning(f"{symbol}: trail attempt {attempt + 1}/{attempts} failed: {e}")
+            try:
+                _p = client.get_open_position(symbol)
+                protect_qty = _order_qty(_p.qty)
+            except Exception:
+                pass
+            if protect_qty == 0:
+                return None, last_err
+            _t.sleep(0.8)
+    return None, last_err
+
+
+def ensure_protective_exits(client=None) -> dict:
+    """Tick-level backstop: every equity position must have a closing exit.
+
+    The Aug 14 fill-qty fix stops NEW naked positions at submit time.
+    This catches everything that still slips through: trail-widen cancel
+    gaps, late fills after the 15s wait, rejected trails, and leftovers
+    from before those commits deployed.
+
+    Never cancels an existing protective order. Only ADDS missing ones.
+    """
+    out = {"checked": 0, "protected": [], "failed": [], "already_ok": 0, "skipped": 0}
+    if paper_only_violation():
+        return {**out, "error": paper_only_violation()}
+    ex = get_executor() if client is None else None
+    client = client or (ex._client if ex is not None else None)
+    if client is None:
+        return {**out, "error": "no broker client"}
+
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus, OrderSide
+        positions = list(client.get_all_positions())
+        orders = list(client.get_orders(GetOrdersRequest(
+            status=QueryOrderStatus.OPEN, limit=200)))
+    except Exception as e:
+        log.error(f"exit backstop: cannot read broker ({e})")
+        return {**out, "error": str(e)}
+
+    out["checked"] = len(positions)
+    naked = naked_equity_symbols(positions, orders)
+    if not naked:
+        out["already_ok"] = len([
+            p for p in positions
+            if not is_crypto_symbol(str(p.symbol)) and not is_option_symbol(str(p.symbol))
+        ])
+        return out
+
+    import time as _t
+    now = _t.time()
+    pos_by_sym = {str(p.symbol): p for p in positions}
+    for sym in naked:
+        last = _protect_failed_at.get(sym)
+        if last and (now - last) < PROTECT_RETRY_SEC:
+            out["skipped"] += 1
+            continue
+        p = pos_by_sym.get(sym)
+        if p is None:
+            continue
+        qty = _order_qty(p.qty)
+        if qty == 0:
+            continue
+        side = OrderSide.SELL if float(p.qty) > 0 else OrderSide.BUY
+        trail_pct = DEFAULT_TRAIL_PCT
+        try:
+            plpc = abs(float(getattr(p, "unrealized_plpc", 0) or 0)) * 100
+            if plpc >= 4:
+                trail_pct = _trail_for_profit(plpc)
+        except Exception:
+            pass
+        order, err = _submit_trail_with_retry(client, sym, qty, side, trail_pct)
+        if order is None:
+            _protect_failed_at[sym] = now
+            out["failed"].append(sym)
+            log.critical(f"🛡️ BACKSTOP FAILED: {sym} still UNPROTECTED ({err})")
+        else:
+            _protect_failed_at.pop(sym, None)
+            out["protected"].append(sym)
+            log.warning(f"🛡️ BACKSTOP: {sym} trailing stop {trail_pct}% on {qty} shares "
+                        f"(was naked)")
+    out["still_naked"] = [s for s in naked if s not in out["protected"]]
+    if out["protected"] or out["failed"]:
+        log.warning(f"exit backstop: protected {out['protected'] or 'none'}; "
+                    f"still naked {out['failed'] or 'none'}")
+    return out
 
 
 def _trail_for_profit(pct_gain: float) -> float:
@@ -439,8 +582,15 @@ def widen_trails_on_survivors(min_days: float = 2.0,
             log.info(f"🪢 TRAIL {sym} {cur:.1f}% -> {widen_to_pct:.1f}% "
                      f"(held {held_days.get(sym)}d, {gain_pct:+.1f}%, "
                      f"${float(p.unrealized_pl):+,.0f}) — protection scaled to gain")
+        # Cancel-then-submit can leave a gap if this process dies between
+        # the two calls. Re-arm anything that ended the pass naked.
+        ensure_protective_exits(ex._client)
     except Exception as e:
         log.warning(f"trail widening failed: {e}")
+        try:
+            ensure_protective_exits()
+        except Exception:
+            pass
 
 
 # ── Module-level singleton ────────────────────────────────────────────────────

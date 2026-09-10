@@ -163,6 +163,7 @@ def snapshot() -> dict:
     # repeatedly consumed buying power invisibly.
     try:
         import trade_ledger as _tl
+        from invariants import ghost_symbols, naked_equity_symbols
         led = {t.symbol.replace("/", "") for t in _tl.open_positions()}
         orphans = [p["symbol"] for p in d.get("positions", [])
                    if not p["is_option"] and p["symbol"] not in led]
@@ -171,8 +172,29 @@ def snapshot() -> dict:
             d["warnings"].append(
                 f"DRIFT: broker holds {len(orphans)} position(s) the ledger has "
                 f"closed: {', '.join(orphans[:8])}")
+        ghosts = ghost_symbols(led, [p["symbol"] for p in d.get("positions", [])])
+        d["ghosts"] = ghosts
+        if ghosts:
+            d["warnings"].append(
+                f"GHOST: ledger shows {len(ghosts)} open the broker does not hold: "
+                f"{', '.join(ghosts[:8])}")
+        try:
+            od = requests.get(f"{PAPER_API}/v2/orders", headers=_hdr(),
+                              params={"status": "open", "limit": 200}, timeout=15).json()
+            naked = naked_equity_symbols(
+                requests.get(f"{PAPER_API}/v2/positions", headers=_hdr(), timeout=15).json(),
+                od)
+            d["naked"] = naked
+            if naked:
+                d["warnings"].append(
+                    f"CRITICAL: {len(naked)} position(s) have NO exit order: "
+                    f"{', '.join(naked[:8])}")
+        except Exception:
+            d["naked"] = []
     except Exception:
         d["orphans"] = []
+        d["ghosts"] = []
+        d["naked"] = []
 
     # Invariant layer — explicit rules plus statistical anomaly detection.
     # The snapshot's own checks catch what it computes; invariants.py

@@ -46,7 +46,7 @@ def check_imports():
     """Every module must import cleanly — an undefined name here is fatal."""
     mods = ["ensemble", "meta_agent", "agent_risk_bridge", "order_executor",
             "trade_ledger", "invariants", "exposure", "regime_detector",
-            "agent_evaluator", "agent_rotator", "report_data"]
+            "agent_evaluator", "agent_rotator", "report_data", "daily_reporter"]
     for m in mods:
         try:
             __import__(m)
@@ -156,6 +156,53 @@ def check_exposure_gates():
         pass
 
 
+def check_paper_only():
+    from invariants import paper_only_violation
+    msg = paper_only_violation()
+    if msg:
+        fail(msg)
+
+
+def check_exit_backstop_wired():
+    """The healer that was missing on 2026-09-09 must actually be called."""
+    import inspect
+    import ensemble
+    import market_scheduler
+    import order_executor
+    if not hasattr(order_executor, "ensure_protective_exits"):
+        fail("order_executor.ensure_protective_exits is missing")
+        return
+    ens_src = inspect.getsource(ensemble.Ensemble.run_cycle)
+    sch_src = inspect.getsource(market_scheduler.run_agent_tick)
+    if "ensure_protective_exits" not in ens_src:
+        fail("ensemble.run_cycle does not call ensure_protective_exits — "
+             "naked positions will only be flagged, not repaired")
+    if "ensure_protective_exits" not in sch_src:
+        fail("market_scheduler.run_agent_tick does not call "
+             "ensure_protective_exits — an ensemble crash would skip protection")
+    if "close_ghosts" not in inspect.getsource(inspect.getmodule(ensemble)):
+        # ensemble imports and calls it inside run_cycle
+        if "close_ghosts" not in ens_src:
+            warn("ensemble.run_cycle does not call close_ghosts")
+
+
+def check_reporter_parses_current_logs():
+    """Sep 9 email showed 0 signals because the regex still matched v11 logs."""
+    import inspect
+    import daily_reporter
+    import ensemble
+    import meta_agent
+    ens = inspect.getsource(ensemble.Ensemble.run_cycle)
+    meta = inspect.getsource(meta_agent)
+    rep = inspect.getsource(daily_reporter.read_scheduler_today)
+    if "Total raw signals" not in ens:
+        fail("ensemble no longer logs 'Total raw signals'")
+    if "Total raw signals" not in rep:
+        fail("daily_reporter does not parse 'Total raw signals'")
+    if "passed synthesis" in meta and "passed synthesis" not in rep:
+        fail("daily_reporter does not parse MetaAgent synthesis line")
+
+
 def check_live_state():
     """Can anything actually trade right now? Reports, does not fail."""
     try:
@@ -185,8 +232,10 @@ def check_live_state():
 
 
 def main() -> int:
-    checks = [check_imports, check_regime_vocabulary, check_weight_arithmetic,
-              check_exposure_gates, check_live_state]
+    checks = [check_imports, check_paper_only, check_regime_vocabulary,
+              check_weight_arithmetic, check_exposure_gates,
+              check_exit_backstop_wired, check_reporter_parses_current_logs,
+              check_live_state]
     for c in checks:
         try:
             c()
