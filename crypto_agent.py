@@ -53,6 +53,10 @@ class CryptoAgent:
     name = "CryptoAgent"
 
     def generate_signals(self) -> list[dict]:
+        from session_gates import CRYPTO_TRADING_ENABLED
+        if not CRYPTO_TRADING_ENABLED:
+            log.info("CryptoAgent disabled — crypto sleeve is off in this bot")
+            return []
         signals = []
         for alpaca_symbol, yf_symbol in CRYPTO_SYMBOLS.items():
             try:

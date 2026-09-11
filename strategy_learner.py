@@ -53,7 +53,7 @@ class StrategyLearner:
         """Run a full learning cycle. Returns the learned params dict."""
         import trade_ledger as _ledger
 
-        all_trades  = _ledger.all_trades()
+        all_trades  = _ledger.epoch_trades()
         closed      = [t for t in all_trades if not t.is_open]
 
         if len(closed) < MIN_SAMPLE:
@@ -150,8 +150,8 @@ class StrategyLearner:
                 if s_total >= 3 and sd["wins"] / s_total < 0.30:
                     bad_symbols.append(sym)
             if bad_symbols:
-                adjustments["avoid_symbols"] = bad_symbols
-                log.info(f"  {agent}: poor symbols {bad_symbols} — flagged to avoid")
+                adjustments["avoid_symbols"] = bad_symbols[:8]
+                log.info(f"  {agent}: poor symbols {bad_symbols[:8]} — flagged to avoid")
 
             agent_params[agent] = {
                 "win_rate":    round(win_rate, 3),
@@ -190,7 +190,7 @@ class StrategyLearner:
 
         params["agent_params"]    = agent_params
         params["best_symbols"]    = best_symbols
-        params["worst_symbols"]   = worst_symbols
+        params["worst_symbols"]   = worst_symbols[:8]
         params["overall_win_rate"] = round(overall_wr, 3)
         params["overall_pnl"]     = round(total_pnl, 2)
         params["trade_count"]     = len(closed)
@@ -199,6 +199,24 @@ class StrategyLearner:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         with open(PARAMS_FILE, "w") as f:
             json.dump(params, f, indent=2)
+
+        try:
+            learn_log = LOGS_DIR / "learning_log.jsonl"
+            with open(learn_log, "a") as lf:
+                lf.write(json.dumps({
+                    "timestamp": params.get("last_learned_at"),
+                    "source": "strategy_learner",
+                    "overall_win_rate": params.get("overall_win_rate"),
+                    "overall_pnl": params.get("overall_pnl"),
+                    "trade_count": params.get("trade_count"),
+                    "best_symbols": best_symbols,
+                    "worst_symbols": params.get("worst_symbols"),
+                    "agents_adjusted": [
+                        n for n, ap in agent_params.items() if ap.get("adjustments")
+                    ],
+                }) + "\n")
+        except Exception:
+            pass
 
         log.info(
             f"StrategyLearner: learning complete — "

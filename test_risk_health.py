@@ -139,15 +139,60 @@ class ReporterLogParse(unittest.TestCase):
             "agent_activity": {},
             "shadow_pnl": dr._empty_pnl_summary(),
             "live_pnl": dr._empty_pnl_summary(),
+            "snapshot": {
+                "today": "2026-09-10",
+                "equity": 98765,
+                "prev_close": 100000,
+                "day_pnl": -1235,
+                "naked": ["AMD"],
+                "ghosts": [],
+                "windows": [
+                    {"label": "1-day", "bot_pct": -1.24, "spy_pct": 0.10, "edge": -1.34},
+                    {"label": "5-day", "bot_pct": -2.00, "spy_pct": 0.50, "edge": -2.50},
+                    {"label": "Since start", "bot_pct": -1.24, "spy_pct": 8.00, "edge": -9.24},
+                ],
+                "warnings": [],
+            },
         }
-        with patch.object(reporter, "_format_intelligence_section",
-                          return_value="<p>snapshot</p>"):
-            html = reporter.format_email_html(data)
+        html = reporter.format_email_html(data)
         self.assertIn("PAPER TRADING", html)
         self.assertIn("not live", html.lower())
         self.assertIn("System errors: 1", html)
         self.assertIn("Entries today: 2", html)
         self.assertIn("Peak raw signals: 12", html)
+        self.assertIn("Bot vs SPY", html)
+        self.assertIn("Naked exits:", html)
+        self.assertNotIn("Daily Report v2", html)
+        self.assertNotIn("v11", html.lower())
+
+    def test_subject_line_is_paper_scorecard(self):
+        import daily_reporter as dr
+        subj = dr.format_email_subject({
+            "today": "2026-09-11",
+            "equity": 98765.4,
+            "prev_close": 100000,
+        })
+        self.assertEqual(
+            subj,
+            "[PAPER] Market day — 2026-09-11 — equity $98,765 (day -1.23%)",
+        )
+
+    def test_kill_switch_and_holiday_skip_send(self):
+        import daily_reporter as dr
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+        with patch.dict(os.environ, {"ENABLE_DAILY_EMAIL": "false"}, clear=False):
+            self.assertIn("ENABLE_DAILY_EMAIL=false", dr.skip_send_reason(send_now=True) or "")
+        saturday = datetime(2026, 9, 12, 16, 35, tzinfo=ET)
+        with patch.object(dr, "daily_email_enabled", return_value=True):
+            with patch.object(dr, "is_open_market_report_day", return_value=False):
+                self.assertIn("market closed", dr.skip_send_reason(send_now=True) or "")
+        self.assertIsNone(dr.skip_send_reason(send_now=False))
+        # holiday helper: Thanksgiving 2026 is a Thursday
+        turkey = datetime(2026, 11, 26, 16, 35, tzinfo=ET)
+        self.assertFalse(dr.is_open_market_report_day(turkey))
+        self.assertFalse(dr.is_open_market_report_day(saturday))
 
 
 class TrailQtyHelper(unittest.TestCase):

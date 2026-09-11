@@ -67,6 +67,11 @@ from performance_logger import PerformanceLogger, LOGS_DIR, SUMMARY
 BENCH_DAYS          = 3      # how long a flagged agent sits out
 ROTATION_LOG        = LOGS_DIR / "rotation_log.jsonl"
 MIN_ACTIVE_AGENTS   = 2      # never bench below this count (safety floor)
+AUTO_ACTIONS        = LOGS_DIR / "auto_actions.json"
+
+# Permanently retired from this bot. CryptoAgent is hard-disabled (crypto
+# sleeve off); it must never be reactivated by a 3-day bench expiry.
+DISABLED_AGENTS = {"CryptoAgent"}
 
 # ── Full 12-agent roster with cross-substitution logic ──────────────────────
 # When an agent underperforms, the rotator promotes its best substitute.
@@ -94,6 +99,12 @@ AGENT_VARIANTS: dict[str, list[str]] = {
     # Timing agents
     "PremarketAgent":      ["SectorRotationAgent"],
     "SectorRotationAgent": ["PremarketAgent"],
+
+    # Mean-reversion / vol — substitute within category
+    "MeanReversionAgent":  ["VolatilityAgent"],
+    "VolatilityAgent":     ["MeanReversionAgent"],
+    "MoversAgent":         ["MomentumAgent", "BreakoutAgent"],
+    "IntermarketAgent":    ["MacroAgent"],
 }
 
 # Agents that are NEVER benched — they provide critical infrastructure.
@@ -132,8 +143,21 @@ class AgentRotator:
 
         actions: list[str] = []
 
+        # Disabled agents stay benched forever — crypto sleeve is off.
+        for name in DISABLED_AGENTS:
+            summary[name] = summary.get(name) or self._blank_agent_entry()
+            if summary[name].get("active", True):
+                if not dry_run:
+                    summary[name]["active"] = False
+                    summary[name]["benched_at"] = "2099-01-01T00:00:00+00:00"
+                action = f"DISABLED {name} — retired from this bot"
+                actions.append(action)
+                self._write_rotation_event(name, "DISABLED", action, dry_run)
+
         # ── Step 1: Re-activate agents whose bench time has expired ───────
-        for name, info in summary.items():
+        for name, info in list(summary.items()):
+            if name in DISABLED_AGENTS:
+                continue
             if info.get("active", True):
                 continue
             benched_at_str = info.get("benched_at")
@@ -172,6 +196,8 @@ class AgentRotator:
         newly_benched: set[str] = set()
 
         for agent_name in flagged_sorted:
+            if agent_name in DISABLED_AGENTS:
+                continue
             # Never bench protected core agents
             if agent_name in PROTECTED_AGENTS:
                 actions.append(f"PROTECTED {agent_name} — core agent, reducing weight instead of benching")
@@ -212,8 +238,19 @@ class AgentRotator:
             self._write_rotation_event(agent_name, "BENCHED", action, dry_run, replacement=replacement)
             active_count -= 1
 
+        # ── Step 2b: Early-promote recovered benched agents ───────────────
+        # A 3-day sit-out is a cooldown, not a sentence. If 20d P&L has
+        # turned positive with enough trades, put them back in today.
+        actions.extend(self._promote_recovered(report, summary, newly_benched, dry_run))
+
+        # ── Step 2c: Apply improver auto-actions (bench/promote only) ─────
+        actions.extend(self._apply_improver_auto_actions(summary, newly_benched, dry_run))
+
         # ── Step 3: Persist updated summary ───────────────────────────────
-        if not dry_run and actions:
+        # Always write: DISABLED_AGENTS and recovered promotions must land
+        # even when the flagged list was empty (the historical no-op).
+        if not dry_run:
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
             with open(SUMMARY, "w") as f:
                 json.dump(summary, f, indent=2)
 
@@ -237,25 +274,106 @@ class AgentRotator:
 
     # ── Internals ──────────────────────────────────────────────────────────
 
+    def _promote_recovered(
+        self,
+        report: EvalReport,
+        summary: dict,
+        newly_benched: set[str],
+        dry_run: bool,
+    ) -> list[str]:
+        from agent_evaluator import MIN_TRADES_TO_EVALUATE
+        actions: list[str] = []
+        stats = {a.name: a for a in report.agents}
+        for name, info in list(summary.items()):
+            if name in DISABLED_AGENTS or name in newly_benched:
+                continue
+            if info.get("active", True):
+                continue
+            st = stats.get(name)
+            if st is None:
+                continue
+            if st.pnl_20d > 0 and st.trades_20d >= MIN_TRADES_TO_EVALUATE:
+                if not dry_run:
+                    summary[name]["active"] = True
+                    summary[name]["benched_at"] = None
+                action = (
+                    f"PROMOTED {name} early — recovered "
+                    f"(20d P&L ${st.pnl_20d:+,.2f} on {st.trades_20d} trades)"
+                )
+                actions.append(action)
+                self._write_rotation_event(name, "PROMOTED", action, dry_run)
+        return actions
+
+    def _apply_improver_auto_actions(
+        self,
+        summary: dict,
+        newly_benched: set[str],
+        dry_run: bool,
+    ) -> list[str]:
+        """Apply safe bench/promote recommendations written by ImproverAgent."""
+        actions: list[str] = []
+        if not AUTO_ACTIONS.exists():
+            return actions
+        try:
+            payload = json.loads(AUTO_ACTIONS.read_text()) or {}
+        except Exception:
+            return actions
+        now = datetime.now(timezone.utc)
+        for item in payload.get("auto") or []:
+            name = str(item.get("agent") or "")
+            op = str(item.get("action") or "").upper()
+            reason = str(item.get("reason") or "improver auto-action")
+            if not name or name in DISABLED_AGENTS or name in PROTECTED_AGENTS:
+                continue
+            if op == "BENCH":
+                if name in newly_benched:
+                    continue
+                entry = summary.get(name) or self._blank_agent_entry()
+                if entry.get("active", True) is False:
+                    continue
+                if not dry_run:
+                    summary[name] = entry
+                    summary[name]["active"] = False
+                    summary[name]["benched_at"] = now.isoformat()
+                newly_benched.add(name)
+                action = f"BENCHED {name} (improver): {reason}"
+                actions.append(action)
+                self._write_rotation_event(name, "BENCHED", action, dry_run)
+            elif op == "PROMOTE":
+                if name in newly_benched:
+                    continue
+                entry = summary.get(name) or self._blank_agent_entry()
+                if entry.get("active", True) is True and name in summary:
+                    continue
+                if not dry_run:
+                    summary[name] = entry
+                    summary[name]["active"] = True
+                    summary[name]["benched_at"] = None
+                action = f"PROMOTED {name} (improver): {reason}"
+                actions.append(action)
+                self._write_rotation_event(name, "PROMOTED", action, dry_run)
+        return actions
+
     def _find_replacement(
         self,
         agent_name: str,
         summary: dict,
         exclude: set[str] | None = None,
     ) -> str | None:
-        """Return the first available (inactive or unknown) variant for agent_name.
+        """Return a currently-benched variant to promote, if any.
 
-        `exclude` lets the caller block agents that were benched earlier in
-        the same rotation cycle — otherwise a just-benched loser could be
-        immediately re-promoted as a sibling's replacement.
+        Missing summary entries mean default-active ensemble members — they
+        are already running, so "promoting" them was a no-op that logged
+        fake substitutions. Only an explicit ``active: false`` is a real
+        promotion candidate.
         """
         exclude = exclude or set()
         variants = AGENT_VARIANTS.get(agent_name, [])
         for variant in variants:
-            if variant in exclude:
+            if variant in exclude or variant in DISABLED_AGENTS:
                 continue
             entry = summary.get(variant)
-            if entry is None or not entry.get("active", False):
+            if isinstance(entry, dict) and entry.get("active", True) is False:
                 return variant
         return None
 

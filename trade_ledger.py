@@ -132,10 +132,22 @@ class Trade:
 
     @property
     def all_agents(self) -> list[str]:
-        agents = [self.primary_agent]
+        """Real signal-agent names only.
+
+        Ledger rows store primaries as ``MetaAgent(NewsAgent, OptionsFlowAgent)``.
+        Downstream weighting/rotation must see NewsAgent + OptionsFlowAgent,
+        never the wrapper string — otherwise MetaAgent weights stay at 1.0
+        because no DEFAULT_WEIGHTS key ever matches.
+        """
+        seen: list[str] = []
+        raws = [self.primary_agent]
         if self.contributors:
-            agents += [a.strip() for a in self.contributors.split(",") if a.strip()]
-        return agents
+            raws += [a.strip() for a in self.contributors.split(",") if a.strip()]
+        for raw in raws:
+            for name in expand_agent_names(raw):
+                if name not in seen:
+                    seen.append(name)
+        return seen
 
     @property
     def opened_date_et(self) -> str:
@@ -149,6 +161,33 @@ def _normalize_side(raw_side: str) -> str:
     if s in SHORT_SIDES: return "SHORT"
     if s in LONG_SIDES:  return "LONG"
     return s  # leave unknowns alone for visibility
+
+
+def expand_agent_names(raw: str) -> list[str]:
+    """Split ``MetaAgent(SubA, SubB)`` into real agent names.
+
+    BrokerSync is a bookkeeping label, not a signal agent — drop it.
+    A bare ``MetaAgent`` wrapper with no inner names yields [].
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    m = re.match(r"^([A-Za-z_]+)\s*\(([^)]*)\)\s*$", raw)
+    if m:
+        wrapper, inner = m.group(1).strip(), m.group(2).strip()
+        parts = [p.strip() for p in inner.split(",") if p.strip()]
+        if wrapper == "MetaAgent":
+            return [p for p in parts if p not in {"MetaAgent", "BrokerSync"}]
+        out = []
+        if wrapper not in {"MetaAgent", "BrokerSync"}:
+            out.append(wrapper)
+        for p in parts:
+            if p not in {"MetaAgent", "BrokerSync"} and p not in out:
+                out.append(p)
+        return out
+    if raw in {"MetaAgent", "BrokerSync"}:
+        return []
+    return [raw]
 
 
 def _parse_agent_field(agent_raw: str) -> tuple[str, str]:
@@ -448,11 +487,9 @@ def _recently_opened(trade: Trade, seconds: int = 120) -> bool:
 def close_ghosts() -> dict:
     """Close ledger rows the broker does not hold.
 
-    sync_from_broker is one-directional: it re-opens orphans. Ghosts —
-    ledger open, broker empty — inflate perceived exposure, trip gates,
-    and produced the SUNB warning. Close them against the actual fill
-    when we have one. Skip rows opened in the last two minutes (fill
-    race) and crypto (own scheduler / different symbol format).
+    Harden (ec855fb): fill-attributed ghost close, skip last 120s / open
+    orders / crypto / options. sync_from_broker only re-opens orphans;
+    this is the reverse heal (SUNB-class ghosts).
     """
     out = {"closed": 0, "skipped_recent": 0, "checked": 0}
     try:

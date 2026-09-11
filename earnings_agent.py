@@ -60,6 +60,13 @@ class EarningsAgent:
             return []
         signals = []
         for symbol in self.watchlist:
+            # ETFs / crypto have no earnings calendar — injecting them via
+            # the dynamic universe produced 150–200 [ERROR] lines/day.
+            if "/" in symbol or "-" in symbol or symbol.endswith("USD"):
+                continue
+            if symbol in {"SPY", "QQQ", "IWM", "DIA", "TQQQ", "SQQQ", "UPRO",
+                          "SPXU", "TNA", "TZA", "LABU", "LABD"}:
+                continue
             try:
                 sig = self._analyze(symbol)
                 if sig:
