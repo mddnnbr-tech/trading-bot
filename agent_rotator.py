@@ -69,9 +69,13 @@ ROTATION_LOG        = LOGS_DIR / "rotation_log.jsonl"
 MIN_ACTIVE_AGENTS   = 2      # never bench below this count (safety floor)
 AUTO_ACTIONS        = LOGS_DIR / "auto_actions.json"
 
-# Permanently retired from this bot. CryptoAgent is hard-disabled (crypto
-# sleeve off); it must never be reactivated by a 3-day bench expiry.
-DISABLED_AGENTS = {"CryptoAgent"}
+# Crypto sleeve is OFF via session_gates.CRYPTO_TRADING_ENABLED (CryptoAgent
+# returns []). That is not a rotator event — never write DISABLED, never
+# park a bench timestamp that would skip REACTIVATED. Only skip CryptoAgent
+# as an AGENT_VARIANTS replacement target.
+SKIP_REPLACEMENT = {"CryptoAgent"}
+
+ROTATOR_EVENTS = frozenset({"FLAG", "BENCHED", "PROMOTED", "REACTIVATED"})
 
 # ── Full 12-agent roster with cross-substitution logic ──────────────────────
 # When an agent underperforms, the rotator promotes its best substitute.
@@ -144,21 +148,8 @@ class AgentRotator:
 
         actions: list[str] = []
 
-        # Disabled agents stay benched forever — crypto sleeve is off.
-        for name in DISABLED_AGENTS:
-            summary[name] = summary.get(name) or self._blank_agent_entry()
-            if summary[name].get("active", True):
-                if not dry_run:
-                    summary[name]["active"] = False
-                    summary[name]["benched_at"] = "2099-01-01T00:00:00+00:00"
-                action = f"DISABLED {name} — retired from this bot"
-                actions.append(action)
-                self._write_rotation_event(name, "DISABLED", action, dry_run)
-
         # ── Step 1: Re-activate agents whose bench time has expired ───────
         for name, info in list(summary.items()):
-            if name in DISABLED_AGENTS:
-                continue
             if info.get("active", True):
                 continue
             benched_at_str = info.get("benched_at")
@@ -197,8 +188,6 @@ class AgentRotator:
         newly_benched: set[str] = set()
 
         for agent_name in flagged_sorted:
-            if agent_name in DISABLED_AGENTS:
-                continue
             flag_action = f"FLAG {agent_name}"
             st = agent_stats.get(agent_name)
             if st is not None and getattr(st, "flag_reason", None):
@@ -256,7 +245,7 @@ class AgentRotator:
             report, summary, newly_benched, dry_run, active_count))
 
         # ── Step 3: Persist updated summary ───────────────────────────────
-        # Always write: DISABLED_AGENTS and recovered promotions must land
+        # Always persist: recovered REACTIVATED and FLAG benches must land
         # even when the flagged list was empty (the historical no-op).
         if not dry_run:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -295,7 +284,7 @@ class AgentRotator:
         actions: list[str] = []
         stats = {a.name: a for a in report.agents}
         for name, info in list(summary.items()):
-            if name in DISABLED_AGENTS or name in newly_benched:
+            if name in newly_benched:
                 continue
             if info.get("active", True):
                 continue
@@ -324,7 +313,8 @@ class AgentRotator:
     ) -> list[str]:
         """Apply improver proposals. Benches use the same MIN_ACTIVE floor
         and _find_replacement as FLAG benches. Recovered sit-outs are
-        REACTIVATED, not PROMOTED. DISABLED is CryptoAgent-only.
+        REACTIVATED, not PROMOTED. Rotator vocab is FLAG/BENCHED/PROMOTED/
+        REACTIVATED only — no DISABLED event.
         """
         actions: list[str] = []
         if not AUTO_ACTIONS.exists():
@@ -338,7 +328,7 @@ class AgentRotator:
             name = str(item.get("agent") or "")
             op = str(item.get("action") or "").upper()
             reason = str(item.get("reason") or "improver auto-action")
-            if not name or name in DISABLED_AGENTS:
+            if not name:
                 continue
             if op == "BENCH":
                 if name in PROTECTED_AGENTS or name in newly_benched:
@@ -408,7 +398,7 @@ class AgentRotator:
         exclude = exclude or set()
         variants = AGENT_VARIANTS.get(agent_name, [])
         for variant in variants:
-            if variant in exclude or variant in DISABLED_AGENTS:
+            if variant in exclude or variant in SKIP_REPLACEMENT:
                 continue
             entry = summary.get(variant)
             if isinstance(entry, dict) and entry.get("active", True) is False:
@@ -436,6 +426,8 @@ class AgentRotator:
         replacement: str | None = None,
     ):
         if dry_run:
+            return
+        if event_type not in ROTATOR_EVENTS:
             return
         record = {
             "timestamp":   datetime.now(timezone.utc).isoformat(),

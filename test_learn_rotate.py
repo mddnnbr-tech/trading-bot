@@ -120,9 +120,23 @@ class LearnerWiring(unittest.TestCase):
         from meta_agent import DEFAULT_WEIGHTS
         self.assertIn("MeanReversionAgent", DEFAULT_WEIGHTS)
 
-    def test_crypto_permanently_disabled_in_rotator(self):
-        from agent_rotator import DISABLED_AGENTS
-        self.assertIn("CryptoAgent", DISABLED_AGENTS)
+    def test_crypto_off_is_session_gate_not_disabled_event(self):
+        import inspect
+        import agent_rotator
+        from session_gates import CRYPTO_TRADING_ENABLED
+        from crypto_agent import CryptoAgent
+        self.assertFalse(CRYPTO_TRADING_ENABLED)
+        self.assertEqual(CryptoAgent().generate_signals(), [])
+        self.assertIn("CryptoAgent", agent_rotator.SKIP_REPLACEMENT)
+        src = inspect.getsource(agent_rotator)
+        self.assertNotIn('"DISABLED"', inspect.getsource(agent_rotator.AgentRotator.run_rotation))
+        self.assertNotIn("2099", inspect.getsource(agent_rotator.AgentRotator.run_rotation))
+        self.assertNotIn("2099", inspect.getsource(agent_rotator.AgentRotator._reactivate_recovered))
+        self.assertNotIn("2099", inspect.getsource(agent_rotator.AgentRotator._write_rotation_event))
+        self.assertEqual(
+            agent_rotator.ROTATOR_EVENTS,
+            frozenset({"FLAG", "BENCHED", "PROMOTED", "REACTIVATED"}),
+        )
 
     def test_improver_uses_rotator_vocab(self):
         import improver_agent

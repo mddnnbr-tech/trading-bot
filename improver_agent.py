@@ -17,8 +17,7 @@ ImproverAgent handles STRUCTURAL recommendations that need human judgment:
 It does NOT mutate agent_summary.json or any live state. Instead it writes
 a timestamped markdown file to `recommendations/` for Baker to review.
 That file is the only handoff. Approval/rejection happens out-of-band
-(edit the DISABLED_AGENTS set in agent_rotator.py, drop new variants in,
-etc.).
+(drop new variants in, leave a sit-out to expire as REACTIVATED, etc.).
 
 Cron suggestion (nightly at 9 PM ET, after the trading day is fully closed):
     0 21 * * 1-5  /usr/bin/python3 /home/mddnnbr/tading-bot/improver_agent.py
@@ -129,9 +128,10 @@ class ImproverAgent:
                     body=(
                         f"`{name}` has been flagged {count} consecutive eval days "
                         f"with a 20-day P&L of {pnl_str}. The bench-and-rotate cycle "
-                        f"has not produced recovery. **Recommendation:** add `{name}` "
-                        f"to `DISABLED_AGENTS` in `agent_rotator.py` to retire it from "
-                        f"the ensemble until a tuned variant is built."
+                        f"has not produced recovery. **Recommendation:** keep "
+                        f"`{name}` benched and review a tuned variant. Do not "
+                        f"invent a rotator DISABLED event — vocab is FLAG / "
+                        f"BENCHED / PROMOTED / REACTIVATED only."
                     ),
                     tags=["agent_retirement", name],
                 ))
@@ -316,9 +316,9 @@ class ImproverAgent:
                 tags=["auto_reactivate", a.name],
             ))
         # Structural: persistent loser with no variant — log for human
-        from agent_rotator import AGENT_VARIANTS, PROTECTED_AGENTS, DISABLED_AGENTS
+        from agent_rotator import AGENT_VARIANTS, PROTECTED_AGENTS
         for a in flagged:
-            if a.name in PROTECTED_AGENTS or a.name in DISABLED_AGENTS:
+            if a.name in PROTECTED_AGENTS or a.name == "CryptoAgent":
                 continue
             if a.pnl_20d < -200 and a.name not in AGENT_VARIANTS:
                 recs.append(Recommendation(
@@ -478,9 +478,9 @@ class ImproverAgent:
             "",
             "## How to apply",
             "",
-            "- **Retire crypto only:** CryptoAgent is the sole "
-            "`DISABLED_AGENTS` entry (2099 bench). Do not DISABLED equity agents. "
-            "Recovered sit-outs are **REACTIVATED**, not PROMOTED.",
+            "- **Crypto sleeve:** `CRYPTO_TRADING_ENABLED=False` and "
+            "`CryptoAgent.generate_signals()` returns `[]`. That is not a "
+            "rotator DISABLED event. Recovered sit-outs are **REACTIVATED**.",
             "- **Add a variant:** drop the new agent module in the project root, "
             "register it in `ensemble.py`, and add an entry to `AGENT_VARIANTS` "
             "in `agent_rotator.py` so the rotator can promote it.",

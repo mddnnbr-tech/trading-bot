@@ -176,12 +176,6 @@ def scorecard_agent_roster(d: dict | None = None) -> list[dict]:
             names.append(name)
     weights = _load_meta_weights()
     skip = {"MetaAgent", "BrokerSync"}
-    disabled = {"CryptoAgent"}
-    try:
-        from agent_rotator import DISABLED_AGENTS
-        disabled = set(DISABLED_AGENTS)
-    except Exception:
-        pass
     roster = []
     for name in names:
         if name in skip:
@@ -190,9 +184,7 @@ def scorecard_agent_roster(d: dict | None = None) -> list[dict]:
         if not isinstance(info, dict):
             info = {}
         ev = eval_agents.get(name) or {}
-        if name in disabled:
-            status = "benched"
-        elif "active" in info:
+        if "active" in info:
             status = "active" if info.get("active", True) else "benched"
         elif "active" in ev:
             status = "active" if ev.get("active", True) else "benched"
