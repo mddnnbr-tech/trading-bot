@@ -295,8 +295,9 @@ class ImproverAgent:
                 title="Rotator should bench flagged underperformers",
                 body=(
                     f"Flagged this eval: {names}. AgentRotator benches these "
-                    f"(except PROTECTED_AGENTS) and early-promotes any benched "
-                    f"agent whose 20d P&L has recovered above $0."
+                    f"(except PROTECTED_AGENTS) with MIN_ACTIVE_AGENTS floor "
+                    f"and early-REACTIVATES any benched agent whose 20d P&L "
+                    f"has recovered above $0."
                 ),
                 tags=["auto_rotate"],
             ))
@@ -307,12 +308,12 @@ class ImproverAgent:
         for a in recovered:
             recs.append(Recommendation(
                 severity="action",
-                title=f"Promote {a.name} (recovered)",
+                title=f"Reactivate {a.name} (recovered)",
                 body=(
                     f"`{a.name}` is benched but 20d P&L is ${a.pnl_20d:+,.2f} "
-                    f"on {a.trades_20d} trades. Safe auto-promote."
+                    f"on {a.trades_20d} trades. Safe auto-reactivate."
                 ),
-                tags=["auto_promote", a.name],
+                tags=["auto_reactivate", a.name],
             ))
         # Structural: persistent loser with no variant — log for human
         from agent_rotator import AGENT_VARIANTS, PROTECTED_AGENTS, DISABLED_AGENTS
@@ -335,26 +336,25 @@ class ImproverAgent:
         return recs
 
     def _write_auto_actions(self, report, recs: list[Recommendation]) -> None:
-        """Machine-readable bench/promote list consumed by AgentRotator."""
+        """Machine-readable proposals. Rotator alone executes FLAG benches
+        (MIN_ACTIVE floor + replacement). Improver does not auto-BENCH."""
         auto = []
         human = []
         for r in recs:
-            if "auto_promote" in r.tags:
+            if "auto_reactivate" in r.tags or "auto_promote" in r.tags:
                 agent = next((t for t in r.tags if t.endswith("Agent")), None)
                 if agent:
-                    auto.append({"action": "PROMOTE", "agent": agent, "reason": r.title})
-            elif "human_create" in r.tags or r.severity == "action" and "auto_promote" not in r.tags:
+                    auto.append({
+                        "action": "REACTIVATE",
+                        "agent": agent,
+                        "reason": r.title,
+                    })
+            elif "human_create" in r.tags or (
+                r.severity == "action"
+                and "auto_reactivate" not in r.tags
+                and "auto_promote" not in r.tags
+            ):
                 human.append({"title": r.title, "body": r.body, "tags": r.tags})
-        # Flagged losers (not protected) → BENCH. Rotator is idempotent.
-        from agent_rotator import PROTECTED_AGENTS, DISABLED_AGENTS
-        for name in report.flagged_agents:
-            if name in PROTECTED_AGENTS or name in DISABLED_AGENTS:
-                continue
-            auto.append({
-                "action": "BENCH",
-                "agent": name,
-                "reason": "flagged underperformer this eval",
-            })
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "generated_at": report.generated_at,
@@ -478,9 +478,9 @@ class ImproverAgent:
             "",
             "## How to apply",
             "",
-            "- **Retire an agent:** add the name to `DISABLED_AGENTS` in "
-            "`agent_rotator.py`, then mark it inactive in `logs/agent_summary.json` "
-            "with `\"benched_at\": \"2099-01-01T00:00:00+00:00\"`.",
+            "- **Retire crypto only:** CryptoAgent is the sole "
+            "`DISABLED_AGENTS` entry (2099 bench). Do not DISABLED equity agents. "
+            "Recovered sit-outs are **REACTIVATED**, not PROMOTED.",
             "- **Add a variant:** drop the new agent module in the project root, "
             "register it in `ensemble.py`, and add an entry to `AGENT_VARIANTS` "
             "in `agent_rotator.py` so the rotator can promote it.",

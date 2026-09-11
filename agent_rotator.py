@@ -100,10 +100,11 @@ AGENT_VARIANTS: dict[str, list[str]] = {
     "PremarketAgent":      ["SectorRotationAgent"],
     "SectorRotationAgent": ["PremarketAgent"],
 
-    # Mean-reversion / vol — substitute within category
-    "MeanReversionAgent":  ["VolatilityAgent"],
-    "VolatilityAgent":     ["MeanReversionAgent"],
-    "MoversAgent":         ["MomentumAgent", "BreakoutAgent"],
+    # Mean-reversion stays in-category. Volatility + Movers on-ramps are
+    # reserved for Edge Spec B (HOLD PR #2) — do not steal them here.
+    "MeanReversionAgent":  [],
+    "VolatilityAgent":     [],
+    "MoversAgent":         [],
     "IntermarketAgent":    ["MacroAgent"],
 }
 
@@ -198,6 +199,12 @@ class AgentRotator:
         for agent_name in flagged_sorted:
             if agent_name in DISABLED_AGENTS:
                 continue
+            flag_action = f"FLAG {agent_name}"
+            st = agent_stats.get(agent_name)
+            if st is not None and getattr(st, "flag_reason", None):
+                flag_action = f"FLAG {agent_name} — {st.flag_reason}"
+            actions.append(flag_action)
+            self._write_rotation_event(agent_name, "FLAG", flag_action, dry_run)
             # Never bench protected core agents
             if agent_name in PROTECTED_AGENTS:
                 actions.append(f"PROTECTED {agent_name} — core agent, reducing weight instead of benching")
@@ -238,13 +245,15 @@ class AgentRotator:
             self._write_rotation_event(agent_name, "BENCHED", action, dry_run, replacement=replacement)
             active_count -= 1
 
-        # ── Step 2b: Early-promote recovered benched agents ───────────────
+        # ── Step 2b: Early-reactivate recovered benched agents ────────────
         # A 3-day sit-out is a cooldown, not a sentence. If 20d P&L has
         # turned positive with enough trades, put them back in today.
-        actions.extend(self._promote_recovered(report, summary, newly_benched, dry_run))
+        actions.extend(self._reactivate_recovered(report, summary, newly_benched, dry_run))
 
-        # ── Step 2c: Apply improver auto-actions (bench/promote only) ─────
-        actions.extend(self._apply_improver_auto_actions(summary, newly_benched, dry_run))
+        # ── Step 2c: Apply improver auto-actions. Improver proposes;
+        # rotator alone executes benches, with the same floor + replacement.
+        actions.extend(self._apply_improver_auto_actions(
+            report, summary, newly_benched, dry_run, active_count))
 
         # ── Step 3: Persist updated summary ───────────────────────────────
         # Always write: DISABLED_AGENTS and recovered promotions must land
@@ -274,13 +283,14 @@ class AgentRotator:
 
     # ── Internals ──────────────────────────────────────────────────────────
 
-    def _promote_recovered(
+    def _reactivate_recovered(
         self,
         report: EvalReport,
         summary: dict,
         newly_benched: set[str],
         dry_run: bool,
     ) -> list[str]:
+        """Early sit-out expiry when 20d P&L has recovered. Vocab: REACTIVATED."""
         from agent_evaluator import MIN_TRADES_TO_EVALUATE
         actions: list[str] = []
         stats = {a.name: a for a in report.agents}
@@ -297,20 +307,25 @@ class AgentRotator:
                     summary[name]["active"] = True
                     summary[name]["benched_at"] = None
                 action = (
-                    f"PROMOTED {name} early — recovered "
+                    f"REACTIVATED {name} early — recovered "
                     f"(20d P&L ${st.pnl_20d:+,.2f} on {st.trades_20d} trades)"
                 )
                 actions.append(action)
-                self._write_rotation_event(name, "PROMOTED", action, dry_run)
+                self._write_rotation_event(name, "REACTIVATED", action, dry_run)
         return actions
 
     def _apply_improver_auto_actions(
         self,
+        report: EvalReport,
         summary: dict,
         newly_benched: set[str],
         dry_run: bool,
+        active_count: int,
     ) -> list[str]:
-        """Apply safe bench/promote recommendations written by ImproverAgent."""
+        """Apply improver proposals. Benches use the same MIN_ACTIVE floor
+        and _find_replacement as FLAG benches. Recovered sit-outs are
+        REACTIVATED, not PROMOTED. DISABLED is CryptoAgent-only.
+        """
         actions: list[str] = []
         if not AUTO_ACTIONS.exists():
             return actions
@@ -323,35 +338,58 @@ class AgentRotator:
             name = str(item.get("agent") or "")
             op = str(item.get("action") or "").upper()
             reason = str(item.get("reason") or "improver auto-action")
-            if not name or name in DISABLED_AGENTS or name in PROTECTED_AGENTS:
+            if not name or name in DISABLED_AGENTS:
                 continue
             if op == "BENCH":
-                if name in newly_benched:
+                if name in PROTECTED_AGENTS or name in newly_benched:
                     continue
                 entry = summary.get(name) or self._blank_agent_entry()
                 if entry.get("active", True) is False:
                     continue
+                if active_count <= MIN_ACTIVE_AGENTS:
+                    actions.append(
+                        f"SKIPPED improver bench of {name} — already at "
+                        f"minimum active agents ({MIN_ACTIVE_AGENTS})"
+                    )
+                    continue
+                replacement = self._find_replacement(
+                    name, summary, exclude=newly_benched)
                 if not dry_run:
                     summary[name] = entry
                     summary[name]["active"] = False
                     summary[name]["benched_at"] = now.isoformat()
+                    if replacement:
+                        summary[replacement] = (
+                            summary.get(replacement) or self._blank_agent_entry()
+                        )
+                        summary[replacement]["active"] = True
+                        summary[replacement]["benched_at"] = None
                 newly_benched.add(name)
-                action = f"BENCHED {name} (improver): {reason}"
+                active_count -= 1
+                action = (
+                    f"BENCHED {name} (improver) → PROMOTED {replacement}: {reason}"
+                    if replacement else
+                    f"BENCHED {name} (improver): {reason}"
+                )
                 actions.append(action)
-                self._write_rotation_event(name, "BENCHED", action, dry_run)
-            elif op == "PROMOTE":
+                self._write_rotation_event(
+                    name, "BENCHED", action, dry_run, replacement=replacement)
+            elif op in ("REACTIVATE", "PROMOTE"):
                 if name in newly_benched:
                     continue
                 entry = summary.get(name) or self._blank_agent_entry()
-                if entry.get("active", True) is True and name in summary:
+                already_active = entry.get("active", True) is True and name in summary
+                if already_active:
                     continue
                 if not dry_run:
                     summary[name] = entry
                     summary[name]["active"] = True
                     summary[name]["benched_at"] = None
-                action = f"PROMOTED {name} (improver): {reason}"
+                # Recovered sit-outs are REACTIVATED. PROMOTED is only for
+                # substituting a benched variant via AGENT_VARIANTS.
+                action = f"REACTIVATED {name} (improver): {reason}"
                 actions.append(action)
-                self._write_rotation_event(name, "PROMOTED", action, dry_run)
+                self._write_rotation_event(name, "REACTIVATED", action, dry_run)
         return actions
 
     def _find_replacement(

@@ -135,38 +135,130 @@ def _rotations_today(today: str) -> list[dict]:
     return rows
 
 
-def _top_agents_rows(limit: int = 3) -> list[dict]:
-    summary = _read_json(LOGS_DIR / "agent_summary.json", {})
-    if not isinstance(summary, dict):
-        return []
-    ranked = []
-    for name, info in summary.items():
-        if not isinstance(info, dict):
-            continue
-        ranked.append({
-            "name": name,
-            "pnl": float(info.get("total_pnl") or 0),
-            "active": bool(info.get("active", True)),
-            "trades": int(info.get("trade_count") or 0),
-        })
-    ranked.sort(key=lambda r: r["pnl"], reverse=True)
-    return ranked[:limit]
-
-
-def _learning_today(today: str) -> list[str]:
-    path = LOGS_DIR / "learning_log.jsonl"
-    out: list[str] = []
-    if not path.exists():
-        return out
+def _load_meta_weights() -> dict:
     try:
-        for line in path.read_text().splitlines():
-            if today not in line:
-                continue
-            rec = json.loads(line)
-            out.append(str(rec.get("action") or rec.get("event") or rec.get("note") or line[:120]))
+        from meta_agent import MetaAgent
+        return dict(MetaAgent._load_performance_weights() or {})
     except Exception:
-        return out
-    return out[:8]
+        try:
+            from meta_agent import DEFAULT_WEIGHTS
+            return dict(DEFAULT_WEIGHTS)
+        except Exception:
+            return {}
+
+
+def scorecard_agent_roster(d: dict | None = None) -> list[dict]:
+    """Full roster: status active|benched, MetaAgent weight, P&L.
+
+    Tests (and callers) may pass ``d['agent_roster']`` to skip disk/ledger.
+    """
+    d = d or {}
+    if "agent_roster" in d:
+        return list(d.get("agent_roster") or [])
+    try:
+        from meta_agent import DEFAULT_WEIGHTS
+        names = list(DEFAULT_WEIGHTS)
+    except Exception:
+        names = []
+    summary = _read_json(LOGS_DIR / "agent_summary.json", {})
+    eval_data = _read_json(LOGS_DIR / "latest_eval.json", {})
+    eval_agents = {
+        a.get("name"): a
+        for a in (eval_data.get("agents") or [])
+        if isinstance(a, dict) and a.get("name")
+    }
+    if isinstance(summary, dict):
+        for name in summary:
+            if name not in names:
+                names.append(name)
+    for name in eval_agents:
+        if name not in names:
+            names.append(name)
+    weights = _load_meta_weights()
+    skip = {"MetaAgent", "BrokerSync"}
+    disabled = {"CryptoAgent"}
+    try:
+        from agent_rotator import DISABLED_AGENTS
+        disabled = set(DISABLED_AGENTS)
+    except Exception:
+        pass
+    roster = []
+    for name in names:
+        if name in skip:
+            continue
+        info = summary.get(name) if isinstance(summary, dict) else {}
+        if not isinstance(info, dict):
+            info = {}
+        ev = eval_agents.get(name) or {}
+        if name in disabled:
+            status = "benched"
+        elif "active" in info:
+            status = "active" if info.get("active", True) else "benched"
+        elif "active" in ev:
+            status = "active" if ev.get("active", True) else "benched"
+        else:
+            status = "active"
+        pnl = info.get("total_pnl")
+        if pnl is None:
+            pnl = ev.get("pnl_20d") or ev.get("pnl_alltime") or 0.0
+        w = weights.get(name)
+        if w is None:
+            w = 1.0 if status == "active" else 0.15
+        roster.append({
+            "name": name,
+            "status": status,
+            "weight": float(w),
+            "pnl": float(pnl or 0),
+        })
+    roster.sort(key=lambda r: r["pnl"], reverse=True)
+    return roster
+
+
+def scorecard_rotation_actions(today: str, d: dict | None = None) -> dict[str, list[str]]:
+    """Today's FLAG / BENCHED / PROMOTED / REACTIVATED (always all four keys).
+
+    FLAG comes from rotation_log AND evaluator ``latest_eval.json`` /
+    ``d['flagged_today']`` so a FLAG that was not yet written to the log
+    still renders on the scorecard.
+    """
+    d = d or {}
+    buckets = {"FLAG": [], "BENCHED": [], "PROMOTED": [], "REACTIVATED": []}
+    if "rotation_actions" in d:
+        src = d.get("rotation_actions") or {}
+        for k in buckets:
+            buckets[k] = list(src.get(k) or [])
+        extra = list(d.get("flagged_today") or [])
+        have = " ".join(buckets["FLAG"]).lower()
+        for name in extra:
+            if name and name.lower() not in have:
+                buckets["FLAG"].append(str(name))
+                have += " " + name.lower()
+        return buckets
+
+    for rec in _rotations_today(today):
+        ev = str(rec.get("event") or "").upper()
+        if ev not in buckets:
+            continue
+        label = rec.get("description") or rec.get("agent") or ev
+        if rec.get("agent") and rec["agent"] not in str(label):
+            label = f"{rec['agent']} — {label}"
+        buckets[ev].append(str(label))
+
+    flagged = list(d.get("flagged_today") or [])
+    eval_data = _read_json(LOGS_DIR / "latest_eval.json", {})
+    gen = str(eval_data.get("generated_at") or "")
+    if not flagged and today in gen:
+        flagged = list(eval_data.get("flagged_agents") or [])
+        for a in eval_data.get("agents") or []:
+            if isinstance(a, dict) and a.get("flagged") and a.get("name"):
+                if a["name"] not in flagged:
+                    flagged.append(a["name"])
+    existing = " ".join(buckets["FLAG"]).lower()
+    for name in flagged:
+        if name and name.lower() not in existing:
+            buckets["FLAG"].append(str(name))
+            existing += " " + name.lower()
+    return buckets
 
 
 # This bot is paper-only. TRADING_MODE=live / PAPER_TRADING=false cannot
@@ -1323,10 +1415,20 @@ class DailyReporter:
         )
 
         windows = snap.get("windows") or []
-        want = {"1-day", "5-day", "Since start"}
+        by_label = {w.get("label"): w for w in windows if w.get("label")}
+        spy_order = ["1-day", "5-day", "Since start"]
+        if "20-day" in by_label:
+            spy_order = ["1-day", "5-day", "20-day", "Since start"]
         wrows = ""
-        for w in windows:
-            if w.get("label") not in want and w.get("label") != "20-day":
+        for label in spy_order:
+            w = by_label.get(label)
+            if not w:
+                wrows += (
+                    f'<tr><td style="padding:5px 8px">{label}</td>'
+                    f'<td style="padding:5px 8px;text-align:right">—</td>'
+                    f'<td style="padding:5px 8px;text-align:right">—</td>'
+                    f'<td style="padding:5px 8px;text-align:right">—</td></tr>'
+                )
                 continue
             wrows += (
                 f'<tr><td style="padding:5px 8px">{w["label"]}</td>'
@@ -1357,45 +1459,40 @@ class DailyReporter:
             + f' &nbsp;•&nbsp; Ledger ghosts: {len(ghosts)}'
         )
 
-        today = snap.get("today") or _today_et().strftime("%Y-%m-%d")
-        rotations = _rotations_today(today)
-        if rotations:
-            rot_items = "".join(
-                f"<li>{r.get('event','?')} {r.get('agent','')} — {r.get('description','')[:140]}</li>"
-                for r in rotations[:8]
+        today = snap.get("today") or d.get("today") or _today_et().strftime("%Y-%m-%d")
+        actions = scorecard_rotation_actions(today, d)
+        act_lines = []
+        for key in ("FLAG", "BENCHED", "PROMOTED", "REACTIVATED"):
+            items = actions.get(key) or []
+            body = "; ".join(items) if items else "none"
+            act_lines.append(
+                f'<div style="font-size:13px;margin:2px 0"><b>{key}:</b> {body}</div>'
             )
-            rot_html = f"<ul style='margin:4px 0 0;padding-left:18px;font-size:13px'>{rot_items}</ul>"
-        else:
-            rot_html = "<p style='color:#94a3b8;font-size:13px;margin:4px 0 0'>No benches/rotations today.</p>"
+        rot_html = "".join(act_lines)
 
-        top = _top_agents_rows(3)
-        if top:
+        roster = scorecard_agent_roster(d)
+        if roster:
             trows = "".join(
-                f'<tr><td style="padding:5px 8px;font-weight:600">{a["name"]}</td>'
-                f'<td style="padding:5px 8px">{("active" if a["active"] else "benched")}</td>'
-                f'<td style="padding:5px 8px;text-align:right;color:{clr(a["pnl"])}">${a["pnl"]:+,.0f}</td>'
-                f'<td style="padding:5px 8px;text-align:right">{a["trades"]}</td></tr>'
-                for a in top
-            )
-            top_html = (
-                '<table style="width:100%;border-collapse:collapse;font-size:13px">'
-                '<thead><tr style="background:#1e293b;color:#fff">'
-                '<th style="padding:6px 8px;text-align:left">Agent</th>'
-                '<th style="padding:6px 8px;text-align:left">Status</th>'
-                '<th style="padding:6px 8px;text-align:right">P&amp;L</th>'
-                '<th style="padding:6px 8px;text-align:right">Trades</th>'
-                '</tr></thead><tbody>' + trows + '</tbody></table>'
+                f'<tr><td style="padding:4px 8px;font-weight:600">{a["name"]}</td>'
+                f'<td style="padding:4px 8px">{a.get("status") or ("active" if a.get("active") else "benched")}</td>'
+                f'<td style="padding:4px 8px;text-align:right">{float(a.get("weight") or 0):.2f}</td>'
+                f'<td style="padding:4px 8px;text-align:right;color:{clr(a.get("pnl"))}">'
+                f'${float(a.get("pnl") or 0):+,.0f}</td></tr>'
+                for a in roster
             )
         else:
-            top_html = "<p style='color:#94a3b8;font-size:13px;margin:0'>No agent_summary.json yet.</p>"
-
-        learn = _learning_today(today)
-        learn_html = (
-            "<ul style='margin:4px 0 0;padding-left:18px;font-size:13px'>"
-            + "".join(f"<li>{x}</li>" for x in learn)
-            + "</ul>"
-            if learn else
-            "<p style='color:#94a3b8;font-size:13px;margin:4px 0 0'>No learning actions logged today.</p>"
+            trows = (
+                '<tr><td colspan="4" style="padding:8px;color:#94a3b8">'
+                'no agent_summary.json / latest_eval.json yet</td></tr>'
+            )
+        roster_html = (
+            '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+            '<thead><tr style="background:#1e293b;color:#fff">'
+            '<th style="padding:6px 8px;text-align:left">Agent</th>'
+            '<th style="padding:6px 8px;text-align:left">Status</th>'
+            '<th style="padding:6px 8px;text-align:right">Weight</th>'
+            '<th style="padding:6px 8px;text-align:right">P&amp;L</th>'
+            '</tr></thead><tbody>' + trows + '</tbody></table>'
         )
 
         warns = snap.get("warnings") or []
@@ -1441,12 +1538,10 @@ class DailyReporter:
     {spy_table}
     <div class="section-title">Open risk</div>
     <p style="font-size:13px;color:#475569;margin:0">{risk_html}</p>
-    <div class="section-title">Benches / rotations today</div>
+    <div class="section-title">Today FLAG / BENCHED / PROMOTED / REACTIVATED</div>
     {rot_html}
-    <div class="section-title">Top 3 agents by P&amp;L</div>
-    {top_html}
-    <div class="section-title">Learning</div>
-    {learn_html}
+    <div class="section-title">Agents (active / benched / weight / P&amp;L)</div>
+    {roster_html}
     <div class="section-title">Errors / signals truth</div>
     <p style="font-size:13px;color:#475569;margin:0">
       Ticks: {sched.get('tick_count', 0):,} / ~390 &nbsp;•&nbsp;

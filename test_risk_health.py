@@ -153,6 +153,18 @@ class ReporterLogParse(unittest.TestCase):
                 ],
                 "warnings": [],
             },
+            "agent_roster": [
+                {"name": "NewsAgent", "status": "active", "weight": 1.00, "pnl": 210},
+                {"name": "MomentumAgent", "status": "benched", "weight": 0.15, "pnl": -80},
+                {"name": "EarningsAgent", "status": "active", "weight": 0.40, "pnl": 12},
+            ],
+            "flagged_today": ["MomentumAgent"],
+            "rotation_actions": {
+                "FLAG": ["MomentumAgent — 20d P&L below ensemble"],
+                "BENCHED": ["MomentumAgent"],
+                "PROMOTED": ["BreakoutAgent"],
+                "REACTIVATED": ["EarningsAgent"],
+            },
         }
         html = reporter.format_email_html(data)
         self.assertIn("PAPER TRADING", html)
@@ -162,8 +174,28 @@ class ReporterLogParse(unittest.TestCase):
         self.assertIn("Peak raw signals: 12", html)
         self.assertIn("Bot vs SPY", html)
         self.assertIn("Naked exits:", html)
+        self.assertIn("Weight", html)
+        self.assertIn("FLAG", html)
+        self.assertIn("BENCHED", html)
+        self.assertIn("PROMOTED", html)
+        self.assertIn("REACTIVATED", html)
+        self.assertIn("MomentumAgent", html)
+        self.assertIn("benched", html)
+        self.assertIn("active", html)
+        self.assertNotIn("Top 3 agents", html)
         self.assertNotIn("Daily Report v2", html)
         self.assertNotIn("v11", html.lower())
+
+    def test_scorecard_renders_evaluator_flags_without_rotation_log(self):
+        import daily_reporter as dr
+        actions = dr.scorecard_rotation_actions("2026-09-11", {
+            "flagged_today": ["BreakoutAgent", "TechnicalAgent"],
+        })
+        self.assertIn("BreakoutAgent", actions["FLAG"])
+        self.assertIn("TechnicalAgent", actions["FLAG"])
+        self.assertEqual(actions["BENCHED"], [])
+        self.assertEqual(actions["PROMOTED"], [])
+        self.assertEqual(actions["REACTIVATED"], [])
 
     def test_subject_line_is_paper_scorecard(self):
         import daily_reporter as dr

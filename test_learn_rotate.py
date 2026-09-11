@@ -137,6 +137,118 @@ class LearnerWiring(unittest.TestCase):
         self.assertIn("ensure_protective_exits", inspect.getsource(ms.run_agent_tick))
         self.assertIn("close_ghosts", inspect.getsource(ms.run_agent_tick))
 
+    def test_volatility_and_movers_variants_empty_for_edge_b(self):
+        from agent_rotator import AGENT_VARIANTS
+        self.assertEqual(AGENT_VARIANTS.get("VolatilityAgent"), [])
+        self.assertEqual(AGENT_VARIANTS.get("MoversAgent"), [])
+        self.assertNotIn("MeanReversionAgent", AGENT_VARIANTS.get("VolatilityAgent") or [])
+        self.assertNotIn("MomentumAgent", AGENT_VARIANTS.get("MoversAgent") or [])
+        self.assertNotIn("BreakoutAgent", AGENT_VARIANTS.get("MoversAgent") or [])
+
+    def test_recovered_sitout_is_reactivated_not_promoted(self):
+        import inspect
+        import agent_rotator
+        src = inspect.getsource(agent_rotator.AgentRotator._reactivate_recovered)
+        self.assertIn("REACTIVATED", src)
+        self.assertNotIn('"PROMOTED"', src)
+        self.assertNotIn("'PROMOTED'", src)
+
+    def test_improver_does_not_auto_bench(self):
+        import inspect
+        import improver_agent
+        src = inspect.getsource(improver_agent.ImproverAgent._write_auto_actions)
+        self.assertNotIn('"BENCH"', src)
+        self.assertIn("REACTIVATE", src)
+
+
+class ImproverMinActiveFloor(unittest.TestCase):
+    def test_improver_bench_respects_min_active_and_finds_replacement(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from agent_rotator import AgentRotator, MIN_ACTIVE_AGENTS
+
+        self.assertEqual(MIN_ACTIVE_AGENTS, 2)
+        blank = AgentRotator._blank_agent_entry()
+        rot = AgentRotator.__new__(AgentRotator)
+        summary = {
+            "MomentumAgent": {**blank, "active": True},
+            "BreakoutAgent": {**blank, "active": True},
+            "TechnicalAgent": {**blank, "active": False},
+        }
+        payload = {
+            "auto": [
+                {"action": "BENCH", "agent": "MomentumAgent", "reason": "test"},
+                {"action": "BENCH", "agent": "BreakoutAgent", "reason": "test"},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "auto_actions.json"
+            p.write_text(json.dumps(payload))
+            events = []
+
+            def _capture(agent_name, event_type, description, dry_run, replacement=None):
+                events.append((event_type, agent_name, replacement))
+
+            with patch("agent_rotator.AUTO_ACTIONS", p):
+                with patch.object(
+                    AgentRotator, "_write_rotation_event", staticmethod(_capture)
+                ):
+                    actions = rot._apply_improver_auto_actions(
+                        report=None,
+                        summary=summary,
+                        newly_benched=set(),
+                        dry_run=True,
+                        active_count=2,
+                    )
+        self.assertTrue(any("SKIPPED improver bench" in a for a in actions))
+        self.assertFalse(any(e[0] == "BENCHED" for e in events))
+        self.assertTrue(summary["MomentumAgent"]["active"])
+        self.assertTrue(summary["BreakoutAgent"]["active"])
+
+    def test_improver_bench_above_floor_uses_find_replacement(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from agent_rotator import AgentRotator
+
+        blank = AgentRotator._blank_agent_entry()
+        rot = AgentRotator.__new__(AgentRotator)
+        summary = {
+            "MomentumAgent": {**blank, "active": True},
+            "NewsAgent": {**blank, "active": True},
+            "SentimentAgent": {**blank, "active": True},
+            "BreakoutAgent": {**blank, "active": False},
+        }
+        payload = {
+            "auto": [
+                {"action": "BENCH", "agent": "MomentumAgent", "reason": "flagged"},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "auto_actions.json"
+            p.write_text(json.dumps(payload))
+            events = []
+
+            def _capture(agent_name, event_type, description, dry_run, replacement=None):
+                events.append((event_type, agent_name, replacement, description))
+
+            with patch("agent_rotator.AUTO_ACTIONS", p):
+                with patch.object(
+                    AgentRotator, "_write_rotation_event", staticmethod(_capture)
+                ):
+                    actions = rot._apply_improver_auto_actions(
+                        report=None,
+                        summary=summary,
+                        newly_benched=set(),
+                        dry_run=False,
+                        active_count=3,
+                    )
+        self.assertFalse(summary["MomentumAgent"]["active"])
+        self.assertTrue(summary["BreakoutAgent"]["active"])
+        self.assertTrue(any(e[0] == "BENCHED" and e[2] == "BreakoutAgent" for e in events))
+        self.assertTrue(any("PROMOTED BreakoutAgent" in a for a in actions))
+
 
 if __name__ == "__main__":
     unittest.main()
