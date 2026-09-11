@@ -436,6 +436,104 @@ def sync_from_broker() -> dict:
     return out
 
 
+def _recently_opened(trade: Trade, seconds: int = 120) -> bool:
+    """True if the row is so new the broker fill may not have landed yet."""
+    try:
+        opened = datetime.fromisoformat(trade.opened_at_et[:19]).replace(tzinfo=ET)
+        return (datetime.now(ET) - opened).total_seconds() < seconds
+    except Exception:
+        return False
+
+
+def close_ghosts() -> dict:
+    """Close ledger rows the broker does not hold.
+
+    sync_from_broker is one-directional: it re-opens orphans. Ghosts —
+    ledger open, broker empty — inflate perceived exposure, trip gates,
+    and produced the SUNB warning. Close them against the actual fill
+    when we have one. Skip rows opened in the last two minutes (fill
+    race) and crypto (own scheduler / different symbol format).
+    """
+    out = {"closed": 0, "skipped_recent": 0, "checked": 0}
+    try:
+        import os as _os, requests as _rq
+        from invariants import is_crypto_symbol, is_option_symbol, ghost_symbols
+        h = {"APCA-API-KEY-ID": _os.getenv("ALPACA_API_KEY", ""),
+             "APCA-API-SECRET-KEY": _os.getenv("ALPACA_API_SECRET", "")}
+        r = _rq.get("https://paper-api.alpaca.markets/v2/positions",
+                    headers=h, timeout=15)
+        if r.status_code != 200:
+            return {**out, "error": f"HTTP {r.status_code}"}
+        broker_syms = {p["symbol"] for p in r.json()}
+        pending = set()
+        try:
+            ords = _rq.get("https://paper-api.alpaca.markets/v2/orders",
+                           headers=h, params={"status": "open", "limit": 200},
+                           timeout=15)
+            if ords.status_code == 200:
+                pending = {o.get("symbol") for o in ords.json() if o.get("symbol")}
+        except Exception:
+            pass
+        fills: dict[str, tuple[float, str]] = {}
+        try:
+            from datetime import timedelta as _td
+            since = (datetime.now(ET) - _td(days=5)).strftime("%Y-%m-%d")
+            fr = _rq.get("https://paper-api.alpaca.markets/v2/account/activities/FILL",
+                         headers=h, params={"after": since, "page_size": 100},
+                         timeout=15)
+            if fr.status_code == 200:
+                for a in fr.json():
+                    sym = a.get("symbol")
+                    if not sym:
+                        continue
+                    prev = fills.get(sym)
+                    if prev is None or a["transaction_time"] > prev[1]:
+                        fills[sym] = (float(a["price"]), a["transaction_time"])
+        except Exception:
+            pass
+    except Exception as e:
+        return {**out, "error": str(e)}
+
+    trades = load_ledger()
+    open_syms = [t.symbol for t in trades.values() if t.is_open]
+    ghosts = ghost_symbols(open_syms, broker_syms)
+    now_iso = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
+    for t in list(trades.values()):
+        if not t.is_open:
+            continue
+        key = t.symbol.replace("/", "")
+        if key not in ghosts:
+            continue
+        if is_crypto_symbol(t.symbol) or is_option_symbol(t.symbol):
+            continue
+        out["checked"] += 1
+        if _recently_opened(t) or t.symbol in pending or key in pending:
+            out["skipped_recent"] += 1
+            continue
+        fill = fills.get(key) or fills.get(t.symbol)
+        if fill is not None:
+            px, when = fill
+            t.status = "stop"
+            t.exit_price = px
+            t.exit_at_et = when[:19].replace("T", " ")
+            t.exit_reason = "broker fill (ghost close)"
+        else:
+            px = t.current_price or t.entry_price
+            t.status = "expired"
+            t.exit_price = px
+            t.exit_at_et = now_iso
+            t.exit_reason = "ghost — broker no longer holds"
+        t.realized_pnl = _pnl_for(t, float(t.exit_price or t.entry_price))
+        t.unrealized_pnl = 0.0
+        t.last_updated_et = now_iso
+        out["closed"] += 1
+    if out["closed"]:
+        save_ledger(trades)
+        log.info(f"ghost close: closed {out['closed']} ledger row(s) the "
+                 f"broker does not hold")
+    return out
+
+
 def refresh_open_positions(max_symbols: int = 60) -> dict:
     """For every open trade, fetch price path, mark hits, update unrealized P&L.
     Returns summary dict for logging."""
@@ -444,6 +542,7 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
         return {"error": "yfinance not installed", "updated": 0}
 
     sync_from_broker()          # heal divergence before evaluating exits
+    close_ghosts()              # close ledger rows the broker does not hold
     trades = load_ledger()
     open_trades = [t for t in trades.values() if t.is_open]
     if not open_trades:
@@ -557,6 +656,39 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                     log.debug(f"{t.symbol}: sim says {status} but broker still "
                               f"holds it — keeping open (trail active)")
                     status = None
+
+            # Ghost close inside the refresh loop: if the broker is reachable
+            # and does not hold this equity, do not wait for MAX_HOLD_DAYS.
+            # That wait is what left SUNB (and any fast round-trip) as a
+            # permanent "open" row until expiry, inflating exposure.
+            if (broker_open is not None
+                    and t.symbol.replace("/", "") not in broker_open
+                    and "/" not in t.symbol
+                    and len(t.symbol) <= 12
+                    and not _recently_opened(t)):
+                _fill = broker_fills.get(t.symbol.replace("/", ""))
+                if _fill is not None:
+                    _px, _when = _fill
+                    t.status       = "stop"
+                    t.exit_price   = _px
+                    t.exit_at_et   = _when[:19].replace("T", " ")
+                    t.exit_reason  = "broker fill (ghost close)"
+                elif last_price is not None:
+                    t.status       = "expired"
+                    t.exit_price   = last_price
+                    t.exit_at_et   = now_iso
+                    t.exit_reason  = "ghost — broker no longer holds"
+                else:
+                    t.last_updated_et = now_iso
+                    trades[t.trade_id] = t
+                    still_open += 1
+                    continue
+                t.realized_pnl   = _pnl_for(t, t.exit_price)
+                t.unrealized_pnl = 0.0
+                expired += 1
+                t.last_updated_et = now_iso
+                trades[t.trade_id] = t
+                continue
 
             if status:
                 t.status        = status

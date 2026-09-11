@@ -36,7 +36,7 @@ from dotenv import load_dotenv
 load_dotenv()
 log = logging.getLogger("Ensemble")
 
-PAPER_TRADING   = os.getenv("PAPER_TRADING", "true").lower() == "true"
+PAPER_TRADING   = True  # live trading is not enabled; env cannot flip this
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "16000"))
 
 # Hard cap on NEW equity entries per trading day. The concentrated-risk
@@ -221,6 +221,24 @@ class Ensemble:
         now = datetime.now(timezone.utc)
         log.info(f"── Ensemble cycle start {now.strftime('%H:%M:%S UTC')} ──")
 
+        # Step 0: protect the book BEFORE any entry decision. Daily-cap /
+        # buying-power / halt early-returns used to skip this, which is how
+        # 7 positions sat naked through a full session (2026-09-09).
+        still_naked: list[str] = []
+        try:
+            from order_executor import ensure_protective_exits
+            protect = ensure_protective_exits()
+            still_naked = list(protect.get("still_naked") or [])
+            if protect.get("protected"):
+                log.warning(f"🛡️ re-armed exits on {', '.join(protect['protected'])}")
+        except Exception as _pe:
+            log.warning(f"exit backstop failed: {_pe}")
+        try:
+            import trade_ledger as _tl_g
+            _tl_g.close_ghosts()
+        except Exception as _ge:
+            log.debug(f"ghost close: {_ge}")
+
         # Step 1: regime
         try:
             regimes = self.regime.detect()
@@ -246,12 +264,17 @@ class Ensemble:
 
         # Step 2: risk gate
         risk_status = self.risk.assess()
+        if still_naked:
+            log.critical(f"NAKED POSITIONS kill-switch: {', '.join(still_naked)} "
+                         f"— blocking new entries until exits are on")
         if risk_status["halt_trading"]:
             log.warning(f"TRADING HALTED: {risk_status['warnings']}")
             # A halt that only blocks new entries is not risk management —
             # on 2026-07-29 it would have frozen the book fully long while
             # the market fell another 1%. Cut the losers on the way out.
             self._derisk_on_halt()
+            return []
+        if still_naked:
             return []
 
         # Step 2a: daily entry budget — once DAILY_TRADE_CAP equity positions
@@ -364,6 +387,11 @@ class Ensemble:
         except Exception as _ee:
             log.debug(f"exposure gate: {_ee}")
 
+        if block_longs and block_shorts:
+            log.warning(f"⚠️ GATE DEADLOCK: longs blocked ({block_longs}) AND "
+                        f"shorts blocked ({block_shorts}) — zero entries possible. "
+                        f"Managing open positions only this tick.")
+
         # Step 2b: dynamic universe injection — the whole market via funnel.
         # Static watchlists cover ~40 core names; the market-wide screens
         # (gainers/losers/most-active) find whatever ELSE is moving today —
@@ -388,6 +416,7 @@ class Ensemble:
         benched = _load_benched_agent_names()
         skipped: list[str] = []
         all_raw_signals: list[dict] = []
+        _fail_log: dict[str, tuple[float, str]] = Ensemble._agent_fail_at
 
         for agent in self.agents:
             if agent.name in benched:
@@ -399,7 +428,18 @@ class Ensemble:
                     log.info(f"{agent.name}: {len(signals)} signal(s)")
                 all_raw_signals.extend(signals)
             except Exception as e:
-                log.error(f"{agent.name} failed: {e}", exc_info=True)
+                # One traceback per unique error per 15 minutes. Logging
+                # ERROR+exc_info every tick is what produced 174-error /
+                # "0 signal" days — the reporter counted every retry.
+                import time as _t
+                msg = f"{agent.name} failed: {e}"
+                prev = _fail_log.get(agent.name)
+                now_s = _t.time()
+                if not prev or prev[1] != msg or now_s - prev[0] > 900:
+                    Ensemble._agent_fail_at[agent.name] = (now_s, msg)
+                    log.warning(msg)
+                else:
+                    log.debug(msg)
 
         if skipped:
             log.info(f"⏸  Benched agents skipped: {', '.join(skipped)}")
@@ -687,6 +727,7 @@ class Ensemble:
     # Symbols any agent signalled recently — injected into every agent's
     # watchlist so corroboration is possible rather than structurally denied.
     _cross_pollinate: set = set()
+    _agent_fail_at: dict = {}
 
     _universe_cache: tuple[float, list[str]] = (0.0, [])
 

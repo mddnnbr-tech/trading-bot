@@ -53,6 +53,80 @@ def _hdr():
             "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET", "")}
 
 
+def is_crypto_symbol(sym: str) -> bool:
+    """Alpaca crypto tickers look like BTCUSD / BTC/USD, not 1-5 letter equities."""
+    s = str(sym or "").replace("/", "").upper()
+    return s.endswith("USD") and len(s) > 5
+
+
+def is_option_symbol(sym: str) -> bool:
+    """OCC option symbols are longer than any equity ticker."""
+    return len(str(sym or "").replace("/", "")) > 12
+
+
+def _field(obj, name, default=None):
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def naked_equity_symbols(positions, orders) -> list[str]:
+    """Equity symbols the broker holds with no closing-side open order.
+
+    An order only protects a position if it CLOSES it: sell against a long,
+    buy against a short. Matching on symbol alone treats any resting order
+    as protection, so a wrong-side order would read as safe while the
+    position sat naked.
+    """
+    qty: dict[str, float] = {}
+    for p in positions:
+        sym = str(_field(p, "symbol", "") or "")
+        q = float(_field(p, "qty", 0) or 0)
+        if sym:
+            qty[sym] = q
+
+    protected: set[str] = set()
+    for o in orders:
+        sym = str(_field(o, "symbol", "") or "")
+        q = qty.get(sym)
+        if q is None or q == 0:
+            continue
+        side = str(_field(o, "side", "") or "").lower().split(".")[-1]
+        if (side == "sell" and q > 0) or (side == "buy" and q < 0):
+            protected.add(sym)
+
+    return sorted(
+        sym for sym, q in qty.items()
+        if q != 0
+        and sym not in protected
+        and not is_crypto_symbol(sym)
+        and not is_option_symbol(sym)
+    )
+
+
+def ghost_symbols(ledger_open_syms, broker_syms) -> list[str]:
+    """Ledger-open equity symbols the broker does not hold."""
+    led = {
+        str(s).replace("/", "")
+        for s in ledger_open_syms
+        if not is_option_symbol(s) and not is_crypto_symbol(s)
+    }
+    brk = {str(s).replace("/", "") for s in broker_syms}
+    return sorted(led - brk)
+
+
+def paper_only_violation() -> str | None:
+    """Non-None iff env asks for live trading, which this bot must refuse."""
+    paper = os.getenv("PAPER_TRADING", "true").strip().lower()
+    mode = os.getenv("TRADING_MODE", "paper").strip().lower()
+    if paper in ("false", "0", "no", "off", "live"):
+        return (f"PAPER_TRADING={paper} — live trading is not wired; "
+                "this bot is paper-only")
+    if mode == "live":
+        return "TRADING_MODE=live — live trading is not wired; this bot is paper-only"
+    return None
+
+
 def check_all() -> list[dict]:
     """Run every invariant. Returns violations, most severe first."""
     v: list[dict] = []
@@ -91,7 +165,7 @@ def check_all() -> list[dict]:
     # fires is a rule everyone learns to scroll past. Option risk is
     # covered instead by rule 8 (premium within budget) and by
     # manage_options_exits() running each tick.
-    equity_syms = {s for s in broker_syms if len(s) <= 12}
+    equity_syms = {s for s in broker_syms if not is_option_symbol(s)}
     orphans = equity_syms - set(ledger_open)
     if orphans:
         fail("WARN", "no_orphan_positions",
@@ -100,13 +174,14 @@ def check_all() -> list[dict]:
              "trade_ledger.sync_from_broker()")
 
     # ── 2. …and the reverse: the ledger must not claim a position the
-    #      broker does not have.
-    ghosts = set(ledger_open) - broker_syms
+    #      broker does not have. Auto-healed each tick by close_ghosts();
+    #      a leftover here means the heal failed or the row is too new.
+    ghosts = ghost_symbols(ledger_open, broker_syms)
     if ghosts:
         fail("WARN", "no_ghost_positions",
              f"ledger shows {len(ghosts)} open the broker does not hold: "
-             f"{', '.join(sorted(ghosts)[:8])}",
-             "these inflate perceived exposure; close them in the ledger")
+             f"{', '.join(ghosts[:8])}",
+             "trade_ledger.close_ghosts()")
 
     # ── 3. No trade may be counted realized AND still open (the $11,003
     #      double-count). Same symbol closed today yet held now.
@@ -130,35 +205,18 @@ def check_all() -> list[dict]:
     # crypto, so manage_crypto_exits() polls every 15 min instead. That
     # substitution is only valid while the poller is actually running —
     # checked separately below rather than assumed.
-    def _is_crypto(sym): return sym.endswith("USD") and len(sym) > 5
-
-    # An order only protects a position if it CLOSES it: sell against a long,
-    # buy against a short. Matching on symbol alone treats any resting order
-    # as protection, so a wrong-side order would read as safe while the
-    # position sat naked. Today's book is clean (verified 2026-08-13: 15
-    # orders, all correct side), but the check could not have told the
-    # difference — and this rule is the last line of defence for unbounded
-    # downside, so it should not depend on that luck holding.
-    _qty = {p["symbol"]: float(p.get("qty") or 0) for p in positions}
-    protected = set()
-    for o in orders:
-        s = o["symbol"]
-        q = _qty.get(s)
-        if q is None or q == 0:
-            continue
-        if (o.get("side") == "sell") if q > 0 else (o.get("side") == "buy"):
-            protected.add(s)
-    naked = [p["symbol"] for p in equities
-             if p["symbol"] not in protected and not _is_crypto(p["symbol"])]
+    # Detection is shared with the tick-level backstop so the report and
+    # the healer cannot disagree about what "protected" means.
+    naked = naked_equity_symbols(positions, orders)
     if naked:
         fail("CRITICAL", "all_positions_protected",
              f"{len(naked)} position(s) have NO exit order: "
-             f"{', '.join(sorted(naked)[:8])} — unbounded downside",
-             "resubmit trailing stops")
+             f"{', '.join(naked[:8])} — unbounded downside",
+             "order_executor.ensure_protective_exits()")
 
     # Crypto's protection IS the poller. If it stops, those positions are
     # silently unprotected with nothing at the broker to catch them.
-    if any(_is_crypto(p["symbol"]) for p in positions):
+    if any(is_crypto_symbol(p["symbol"]) for p in positions):
         try:
             cl = BASE / "logs" / "crypto_scheduler.log"
             age_min = (datetime.now().timestamp() - cl.stat().st_mtime) / 60
