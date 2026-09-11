@@ -138,11 +138,26 @@ class AgentRiskBridge:
         stop       = signal.get("stop_loss_price", 0.0)
         target     = signal.get("target_price", 0.0)
 
-        # ── Step 2: Confidence gate ─────────────────────────────────────────
-        if confidence < MIN_CONFIDENCE:
+        # ── Step 2: Confidence gate (learner can raise the floor) ──────────
+        min_conf = MIN_CONFIDENCE
+        try:
+            from strategy_learner import StrategyLearner
+            from trade_ledger import expand_agent_names
+            names = expand_agent_names(str(signal.get("original_agent") or ""))
+            names += expand_agent_names(str(signal.get("agent") or ""))
+            deltas = [
+                float((StrategyLearner.get_agent_adjustment(n) or {}).get(
+                    "confidence_threshold_delta") or 0)
+                for n in names
+            ]
+            if deltas:
+                min_conf = MIN_CONFIDENCE + max(0.0, max(deltas))
+        except Exception:
+            pass
+        if confidence < min_conf:
             return self._reject(
                 signal, account_tier,
-                f"Confidence {confidence:.2f} below minimum {MIN_CONFIDENCE}"
+                f"Confidence {confidence:.2f} below minimum {min_conf:.2f}"
             )
 
         # ── Step 3: Price sanity ────────────────────────────────────────────

@@ -91,6 +91,7 @@ DEFAULT_WEIGHTS = {
     "VolatilityAgent":     1.0,
     "IntermarketAgent":    1.0,
     "MoversAgent":         1.0,
+    "MeanReversionAgent":  1.0,
 }
 # Note: RiskAgent is a monitor only — not a signal source
 
@@ -468,14 +469,20 @@ class MetaAgent:
                 if t.is_open:
                     continue
                 pnl = t.realized_pnl or 0.0
+                # t.all_agents now unwraps MetaAgent(...) so NewsAgent
+                # actually receives the P&L instead of a wrapper string
+                # that never matched DEFAULT_WEIGHTS (weights stuck at 1.0).
                 for agent in t.all_agents:
-                    if agent in agent_pnl:
-                        agent_pnl[agent] += pnl
+                    if agent in {"MetaAgent", "BrokerSync"}:
+                        continue
+                    agent_pnl.setdefault(agent, 0.0)
+                    agent_pnl[agent] += pnl
 
             # ── Power-curve weights ─────────────────────────────────────
             max_pnl = max(agent_pnl.values(), default=0.0)
             weights: dict[str, float] = {}
 
+            roster = set(DEFAULT_WEIGHTS) | set(agent_pnl)
             if max_pnl <= 0:
                 # Check if this is "no closed trades yet" vs "genuinely underwater"
                 closed_with_pnl = [
@@ -491,10 +498,11 @@ class MetaAgent:
                     "MetaAgent: no positive P&L in last 20d across signal agents "
                     f"— using MIN_AGENT_WEIGHT ({MIN_AGENT_WEIGHT}) for all"
                 )
-                for name in DEFAULT_WEIGHTS:
+                for name in roster:
                     weights[name] = MIN_AGENT_WEIGHT
             else:
-                for name, pnl in agent_pnl.items():
+                for name in roster:
+                    pnl = agent_pnl.get(name, 0.0)
                     if pnl > 0:
                         raw = (pnl / max_pnl) ** PROFIT_WEIGHT_EXPONENT
                         weights[name] = max(raw, MIN_AGENT_WEIGHT)
@@ -509,7 +517,7 @@ class MetaAgent:
             closed.sort(key=lambda t: t.exit_at_et or t.opened_at_et,
                         reverse=True)
 
-            for name in DEFAULT_WEIGHTS:
+            for name in roster:
                 streak = 0
                 for t in closed:
                     if name not in t.all_agents:

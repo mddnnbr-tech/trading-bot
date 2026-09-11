@@ -205,6 +205,9 @@ def check_unprotected_and_heal() -> list[str]:
     except Exception as e:
         issues.append(f"WARNING: ghost close failed ({e})")
     return issues
+
+
+def check_email_auth() -> list[str]:
     """Verify Gmail SMTP creds actually authenticate (cheap, no email sent)."""
     if not GMAIL_ADDRESS or not GMAIL_APP_PW:
         return ["WARNING: GMAIL_ADDRESS or GMAIL_APP_PASSWORD not set — daily/weekly emails will silently fail"]
@@ -291,7 +294,8 @@ def main():
         for i in issues:
             print(f"  • {i}")
         if _should_alert(issues):
-            send_alert(issues)
+            criticals = [i for i in issues if i.startswith("CRITICAL")]
+            send_alert(criticals)
         else:
             print("(logged only — no critical findings or already alerted within 6h)")
     else:

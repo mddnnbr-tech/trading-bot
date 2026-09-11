@@ -67,6 +67,15 @@ from performance_logger import PerformanceLogger, LOGS_DIR, SUMMARY
 BENCH_DAYS          = 3      # how long a flagged agent sits out
 ROTATION_LOG        = LOGS_DIR / "rotation_log.jsonl"
 MIN_ACTIVE_AGENTS   = 2      # never bench below this count (safety floor)
+AUTO_ACTIONS        = LOGS_DIR / "auto_actions.json"
+
+# Crypto sleeve is OFF via session_gates.CRYPTO_TRADING_ENABLED (CryptoAgent
+# returns []). That is not a rotator event — never write DISABLED, never
+# park a bench timestamp that would skip REACTIVATED. Only skip CryptoAgent
+# as an AGENT_VARIANTS replacement target.
+SKIP_REPLACEMENT = {"CryptoAgent"}
+
+ROTATOR_EVENTS = frozenset({"FLAG", "BENCHED", "PROMOTED", "REACTIVATED"})
 
 # ── Full 12-agent roster with cross-substitution logic ──────────────────────
 # When an agent underperforms, the rotator promotes its best substitute.
@@ -94,6 +103,13 @@ AGENT_VARIANTS: dict[str, list[str]] = {
     # Timing agents
     "PremarketAgent":      ["SectorRotationAgent"],
     "SectorRotationAgent": ["PremarketAgent"],
+
+    # Mean-reversion stays in-category. Volatility + Movers on-ramps are
+    # reserved for Edge Spec B (HOLD PR #2) — do not steal them here.
+    "MeanReversionAgent":  [],
+    "VolatilityAgent":     [],
+    "MoversAgent":         [],
+    "IntermarketAgent":    ["MacroAgent"],
 }
 
 # Agents that are NEVER benched — they provide critical infrastructure.
@@ -133,7 +149,7 @@ class AgentRotator:
         actions: list[str] = []
 
         # ── Step 1: Re-activate agents whose bench time has expired ───────
-        for name, info in summary.items():
+        for name, info in list(summary.items()):
             if info.get("active", True):
                 continue
             benched_at_str = info.get("benched_at")
@@ -172,6 +188,12 @@ class AgentRotator:
         newly_benched: set[str] = set()
 
         for agent_name in flagged_sorted:
+            flag_action = f"FLAG {agent_name}"
+            st = agent_stats.get(agent_name)
+            if st is not None and getattr(st, "flag_reason", None):
+                flag_action = f"FLAG {agent_name} — {st.flag_reason}"
+            actions.append(flag_action)
+            self._write_rotation_event(agent_name, "FLAG", flag_action, dry_run)
             # Never bench protected core agents
             if agent_name in PROTECTED_AGENTS:
                 actions.append(f"PROTECTED {agent_name} — core agent, reducing weight instead of benching")
@@ -212,8 +234,21 @@ class AgentRotator:
             self._write_rotation_event(agent_name, "BENCHED", action, dry_run, replacement=replacement)
             active_count -= 1
 
+        # ── Step 2b: Early-reactivate recovered benched agents ────────────
+        # A 3-day sit-out is a cooldown, not a sentence. If 20d P&L has
+        # turned positive with enough trades, put them back in today.
+        actions.extend(self._reactivate_recovered(report, summary, newly_benched, dry_run))
+
+        # ── Step 2c: Apply improver auto-actions. Improver proposes;
+        # rotator alone executes benches, with the same floor + replacement.
+        actions.extend(self._apply_improver_auto_actions(
+            report, summary, newly_benched, dry_run, active_count))
+
         # ── Step 3: Persist updated summary ───────────────────────────────
-        if not dry_run and actions:
+        # Always persist: recovered REACTIVATED and FLAG benches must land
+        # even when the flagged list was empty (the historical no-op).
+        if not dry_run:
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
             with open(SUMMARY, "w") as f:
                 json.dump(summary, f, indent=2)
 
@@ -237,25 +272,136 @@ class AgentRotator:
 
     # ── Internals ──────────────────────────────────────────────────────────
 
+    def _reactivate_recovered(
+        self,
+        report: EvalReport,
+        summary: dict,
+        newly_benched: set[str],
+        dry_run: bool,
+    ) -> list[str]:
+        """Early sit-out expiry when 20d P&L has recovered. Vocab: REACTIVATED."""
+        from agent_evaluator import MIN_TRADES_TO_EVALUATE
+        actions: list[str] = []
+        stats = {a.name: a for a in report.agents}
+        for name, info in list(summary.items()):
+            if name in newly_benched:
+                continue
+            if info.get("active", True):
+                continue
+            st = stats.get(name)
+            if st is None:
+                continue
+            if st.pnl_20d > 0 and st.trades_20d >= MIN_TRADES_TO_EVALUATE:
+                if not dry_run:
+                    summary[name]["active"] = True
+                    summary[name]["benched_at"] = None
+                action = (
+                    f"REACTIVATED {name} early — recovered "
+                    f"(20d P&L ${st.pnl_20d:+,.2f} on {st.trades_20d} trades)"
+                )
+                actions.append(action)
+                self._write_rotation_event(name, "REACTIVATED", action, dry_run)
+        return actions
+
+    def _apply_improver_auto_actions(
+        self,
+        report: EvalReport,
+        summary: dict,
+        newly_benched: set[str],
+        dry_run: bool,
+        active_count: int,
+    ) -> list[str]:
+        """Apply improver proposals. Benches use the same MIN_ACTIVE floor
+        and _find_replacement as FLAG benches. Recovered sit-outs are
+        REACTIVATED, not PROMOTED. Rotator vocab is FLAG/BENCHED/PROMOTED/
+        REACTIVATED only — no DISABLED event.
+        """
+        actions: list[str] = []
+        if not AUTO_ACTIONS.exists():
+            return actions
+        try:
+            payload = json.loads(AUTO_ACTIONS.read_text()) or {}
+        except Exception:
+            return actions
+        now = datetime.now(timezone.utc)
+        for item in payload.get("auto") or []:
+            name = str(item.get("agent") or "")
+            op = str(item.get("action") or "").upper()
+            reason = str(item.get("reason") or "improver auto-action")
+            if not name:
+                continue
+            if op == "BENCH":
+                if name in PROTECTED_AGENTS or name in newly_benched:
+                    continue
+                entry = summary.get(name) or self._blank_agent_entry()
+                if entry.get("active", True) is False:
+                    continue
+                if active_count <= MIN_ACTIVE_AGENTS:
+                    actions.append(
+                        f"SKIPPED improver bench of {name} — already at "
+                        f"minimum active agents ({MIN_ACTIVE_AGENTS})"
+                    )
+                    continue
+                replacement = self._find_replacement(
+                    name, summary, exclude=newly_benched)
+                if not dry_run:
+                    summary[name] = entry
+                    summary[name]["active"] = False
+                    summary[name]["benched_at"] = now.isoformat()
+                    if replacement:
+                        summary[replacement] = (
+                            summary.get(replacement) or self._blank_agent_entry()
+                        )
+                        summary[replacement]["active"] = True
+                        summary[replacement]["benched_at"] = None
+                newly_benched.add(name)
+                active_count -= 1
+                action = (
+                    f"BENCHED {name} (improver) → PROMOTED {replacement}: {reason}"
+                    if replacement else
+                    f"BENCHED {name} (improver): {reason}"
+                )
+                actions.append(action)
+                self._write_rotation_event(
+                    name, "BENCHED", action, dry_run, replacement=replacement)
+            elif op in ("REACTIVATE", "PROMOTE"):
+                if name in newly_benched:
+                    continue
+                entry = summary.get(name) or self._blank_agent_entry()
+                already_active = entry.get("active", True) is True and name in summary
+                if already_active:
+                    continue
+                if not dry_run:
+                    summary[name] = entry
+                    summary[name]["active"] = True
+                    summary[name]["benched_at"] = None
+                # Recovered sit-outs are REACTIVATED. PROMOTED is only for
+                # substituting a benched variant via AGENT_VARIANTS.
+                action = f"REACTIVATED {name} (improver): {reason}"
+                actions.append(action)
+                self._write_rotation_event(name, "REACTIVATED", action, dry_run)
+        return actions
+
     def _find_replacement(
         self,
         agent_name: str,
         summary: dict,
         exclude: set[str] | None = None,
     ) -> str | None:
-        """Return the first available (inactive or unknown) variant for agent_name.
+        """Return a currently-benched variant to promote, if any.
 
-        `exclude` lets the caller block agents that were benched earlier in
-        the same rotation cycle — otherwise a just-benched loser could be
-        immediately re-promoted as a sibling's replacement.
+        Missing summary entries mean default-active ensemble members — they
+        are already running, so "promoting" them was a no-op that logged
+        fake substitutions. Only an explicit ``active: false`` is a real
+        promotion candidate.
         """
         exclude = exclude or set()
         variants = AGENT_VARIANTS.get(agent_name, [])
         for variant in variants:
-            if variant in exclude:
+            if variant in exclude or variant in SKIP_REPLACEMENT:
                 continue
             entry = summary.get(variant)
-            if entry is None or not entry.get("active", False):
+            if isinstance(entry, dict) and entry.get("active", True) is False:
                 return variant
         return None
 
@@ -280,6 +426,8 @@ class AgentRotator:
         replacement: str | None = None,
     ):
         if dry_run:
+            return
+        if event_type not in ROTATOR_EVENTS:
             return
         record = {
             "timestamp":   datetime.now(timezone.utc).isoformat(),

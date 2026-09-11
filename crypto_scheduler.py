@@ -46,6 +46,11 @@ ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100000"))
 
 
 def run_crypto_tick() -> list[dict]:
+    from session_gates import CRYPTO_TRADING_ENABLED, assert_paper_only
+    assert_paper_only("crypto_scheduler")
+    if not CRYPTO_TRADING_ENABLED:
+        log.info("Crypto sleeve DISABLED in this bot — no new BTC/ETH/SOL entries")
+        return []
     from crypto_agent import CryptoAgent
     from risk_agent import RiskAgent
     from agent_risk_bridge import AgentRiskBridge

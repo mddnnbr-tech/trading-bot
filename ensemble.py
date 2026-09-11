@@ -33,6 +33,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from session_gates import (
+    CRYPTO_TRADING_ENABLED,
+    assert_paper_only,
+    equity_entries_allowed,
+    is_crypto_symbol,
+)
+
 load_dotenv()
 log = logging.getLogger("Ensemble")
 
@@ -262,6 +269,18 @@ class Ensemble:
         except Exception as _we:
             log.debug(f"trail widening: {_we}")
 
+        # Step 1d: paper-only + RTH gate. After-hours we still healed
+        # options/trails above; we do not scan or open new equity risk.
+        from session_gates import (
+            assert_paper_only, equity_entries_allowed, is_crypto_symbol,
+        )
+        assert_paper_only("ensemble")
+        _entries_ok, _entry_reason = equity_entries_allowed()
+        if not _entries_ok:
+            log.info(f"No new entries this tick — {_entry_reason}; "
+                     f"managing open positions only")
+            return []
+
         # Step 2: risk gate
         risk_status = self.risk.assess()
         if still_naked:
@@ -404,7 +423,10 @@ class Ensemble:
         dynamic = self._dynamic_universe()
         dynamic = list(dict.fromkeys(list(dynamic) + list(Ensemble._cross_pollinate)))
         if dynamic:
+            no_inject = {"EarningsAgent"}  # calendar 404s on random names
             for agent in self.agents:
+                if getattr(agent, "name", "") in no_inject:
+                    continue
                 wl = getattr(agent, "watchlist", None)
                 if isinstance(wl, list):
                     if not hasattr(agent, "_base_watchlist"):
@@ -425,6 +447,7 @@ class Ensemble:
             try:
                 signals = agent.generate_signals()
                 if signals:
+                    signals = [s for s in signals if not is_crypto_symbol(s.get("symbol"))]
                     log.info(f"{agent.name}: {len(signals)} signal(s)")
                 all_raw_signals.extend(signals)
             except Exception as e:
@@ -514,8 +537,16 @@ class Ensemble:
                     log.info(f"📈 SKIPPED: {signal['symbol']:6} {signal['direction']:5} "
                              f"— {block_shorts}")
                     continue
+                if is_crypto_symbol(signal.get("symbol")):
+                    log.info(f"⏭  SKIPPED: {signal['symbol']} — crypto sleeve disabled")
+                    continue
 
                 signal = self._normalize_geometry(signal)
+                learned_skip = self._apply_learned_adjustments(signal)
+                if learned_skip:
+                    log.info(f"🧠 SKIPPED: {signal['symbol']:6} {signal['direction']:5} "
+                             f"— learner: {learned_skip}")
+                    continue
                 if signal.get("_falling_knife"):
                     log.info(f"🔪 SKIPPED: {signal['symbol']:6} long — falling knife "
                              f"({signal['_falling_knife']}); gap risk exceeds trail protection")
@@ -670,10 +701,86 @@ class Ensemble:
             out = set(ranked[:MAX_AVOID_SYMBOLS])
         except Exception as e:
             log.debug(f"avoid-list computation failed: {e}")
+        # Also consume learned_params.json — get_worst_symbols() used to
+        # have zero live callers. Cap the union so a stale file cannot
+        # blacklist the universe.
+        try:
+            from strategy_learner import StrategyLearner
+            learned = set(StrategyLearner.get_worst_symbols() or [])
+            out |= set(list(learned)[:MAX_AVOID_SYMBOLS])
+            out = set(list(out)[:MAX_AVOID_SYMBOLS])
+        except Exception:
+            pass
         cls._avoid_cache = (time.time(), out)
         if out:
             log.info(f"🧠 Learner avoid-list active ({len(out)}): {', '.join(sorted(out))}")
         return out
+
+    @staticmethod
+    def _apply_learned_adjustments(signal: dict) -> str:
+        """Apply strategy_learner.get_agent_adjustment() to a live signal.
+
+        Returns a skip reason, or "" to keep the signal. Mutates stop
+        levels in place when stop_loss_delta_pct is set.
+        """
+        try:
+            from strategy_learner import StrategyLearner
+            from trade_ledger import expand_agent_names
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo
+        except Exception:
+            return ""
+        raws = [
+            str(signal.get("original_agent") or ""),
+            str(signal.get("contributing_agents") or ""),
+            str(signal.get("agent") or ""),
+        ]
+        names: list[str] = []
+        for raw in raws:
+            for n in expand_agent_names(raw):
+                if n and n not in names:
+                    names.append(n)
+        if not names:
+            return ""
+        conf_delta = 0.0
+        stop_delta = 0.0
+        hour_block = None
+        for name in names:
+            adj = StrategyLearner.get_agent_adjustment(name) or {}
+            try:
+                conf_delta = max(conf_delta, float(adj.get("confidence_threshold_delta") or 0))
+            except (TypeError, ValueError):
+                pass
+            try:
+                stop_delta = max(stop_delta, float(adj.get("stop_loss_delta_pct") or 0))
+            except (TypeError, ValueError):
+                pass
+            hours = adj.get("best_hours_et")
+            if isinstance(hours, list) and hours and hour_block is None:
+                # Only the first (highest-conviction / original) agent with
+                # an hour preference may stand the signal down.
+                hour_block = (name, set(int(h) for h in hours if str(h).isdigit() or isinstance(h, int)))
+        raw_conf = float(signal.get("raw_confidence") or signal.get("confidence") or 0)
+        from agent_risk_bridge import MIN_CONFIDENCE
+        floor = MIN_CONFIDENCE + max(0.0, conf_delta)
+        if raw_conf < floor:
+            return f"{names[0]} conf {raw_conf:.2f} < learned floor {floor:.2f}"
+        if hour_block:
+            name, hours = hour_block
+            now_h = _dt.now(ZoneInfo("America/New_York")).hour
+            if now_h not in hours:
+                return f"{name} stands down outside learned hours {sorted(hours)} ET"
+        if stop_delta and signal.get("entry_price") and signal.get("stop_loss_price"):
+            entry = float(signal["entry_price"])
+            stop = float(signal["stop_loss_price"])
+            direction = str(signal.get("direction", "long")).lower()
+            if direction == "long":
+                signal["stop_loss_price"] = round(stop - entry * stop_delta, 2)
+            else:
+                signal["stop_loss_price"] = round(stop + entry * stop_delta, 2)
+            signal.setdefault("reasons", []).append(
+                f"learner stop_delta {stop_delta:+.3f}")
+        return ""
 
     _derisked_on: str = ""      # ET date the halt de-risk already ran
 
@@ -753,6 +860,8 @@ class Ensemble:
                         price = float(q.get("regularMarketPrice") or 0)
                         vol   = float(q.get("regularMarketVolume") or 0)
                         if (sym and "." not in sym and "-" not in sym
+                                and "/" not in sym
+                                and not is_crypto_symbol(sym)
                                 and price >= 5 and vol >= 500_000
                                 and sym not in symbols):
                             symbols.append(sym)

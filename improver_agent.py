@@ -17,8 +17,7 @@ ImproverAgent handles STRUCTURAL recommendations that need human judgment:
 It does NOT mutate agent_summary.json or any live state. Instead it writes
 a timestamped markdown file to `recommendations/` for Baker to review.
 That file is the only handoff. Approval/rejection happens out-of-band
-(edit the DISABLED_AGENTS set in agent_rotator.py, drop new variants in,
-etc.).
+(drop new variants in, leave a sit-out to expire as REACTIVATED, etc.).
 
 Cron suggestion (nightly at 9 PM ET, after the trading day is fully closed):
     0 21 * * 1-5  /usr/bin/python3 /home/mddnnbr/tading-bot/improver_agent.py
@@ -54,7 +53,8 @@ REC_DIR        = Path(__file__).parent / "analysis"
 ROTATION_LOG   = LOGS_DIR / "rotation_log.jsonl"
 EVAL_HISTORY   = LOGS_DIR / "eval_history.jsonl"  # written by this agent
 TRADE_LOG      = LOGS_DIR / "trade_log.jsonl"
-SUMMARY_FILE   = LOGS_DIR / "agent_summary.json"
+AUTO_ACTIONS   = LOGS_DIR / "auto_actions.json"
+LEARNING_LOG   = LOGS_DIR / "learning_log.jsonl"
 
 
 @dataclass
@@ -89,8 +89,11 @@ class ImproverAgent:
         recs.extend(self._check_signal_rejection_rate())
         recs.extend(self._check_ensemble_drawdown(report))
         recs.extend(self._check_top_performer_concentration(report))
+        recs.extend(self._check_rotate_create(report))
 
+        self._write_auto_actions(report, recs)
         path = self._write_markdown(report, recs)
+        self._append_learning_log(report, recs, path)
         return path
 
     # ── Checks ──────────────────────────────────────────────────────────────
@@ -125,9 +128,10 @@ class ImproverAgent:
                     body=(
                         f"`{name}` has been flagged {count} consecutive eval days "
                         f"with a 20-day P&L of {pnl_str}. The bench-and-rotate cycle "
-                        f"has not produced recovery. **Recommendation:** add `{name}` "
-                        f"to `DISABLED_AGENTS` in `agent_rotator.py` to retire it from "
-                        f"the ensemble until a tuned variant is built."
+                        f"has not produced recovery. **Recommendation:** keep "
+                        f"`{name}` benched and review a tuned variant. Do not "
+                        f"invent a rotator DISABLED event — vocab is FLAG / "
+                        f"BENCHED / PROMOTED / REACTIVATED only."
                     ),
                     tags=["agent_retirement", name],
                 ))
@@ -151,17 +155,21 @@ class ImproverAgent:
                       if not t.is_open and (t.exit_at_et or "")[:10] >= cut]
             if not recent:
                 recs.append(Recommendation(
-                    priority="REVIEW",
+                    severity="warn",
                     title="No trades closed in 3 days",
-                    detail=("Ledger shows no closed positions in 72h. Either "
-                            "everything open is still running, or exits are not "
-                            "being recorded -- check refresh_open_positions and "
-                            "the broker sync."),
-                    tags=["pipeline"]))
+                    body=("Ledger shows no closed positions in 72h. Either "
+                          "everything open is still running, or exits are not "
+                          "being recorded — check refresh_open_positions and "
+                          "the broker sync."),
+                    tags=["pipeline"],
+                ))
         except Exception as e:
             recs.append(Recommendation(
-                priority="REVIEW", title="Ledger unreadable",
-                detail=f"trade_ledger raised: {e}", tags=["pipeline"]))
+                severity="warn",
+                title="Ledger unreadable",
+                body=f"trade_ledger raised: {e}",
+                tags=["pipeline"],
+            ))
         return recs
 
     def _check_signal_rejection_rate(self) -> list[Recommendation]:
@@ -275,6 +283,98 @@ class ImproverAgent:
             ))
         return recs
 
+    def _check_rotate_create(self, report) -> list[Recommendation]:
+        """Actionable rotate/create ideas the rotator can apply, plus human ones."""
+        recs: list[Recommendation] = []
+        benched = [a for a in report.agents if not a.active]
+        flagged = [a for a in report.agents if a.flagged]
+        if flagged:
+            names = ", ".join(a.name for a in flagged)
+            recs.append(Recommendation(
+                severity="info",
+                title="Rotator should bench flagged underperformers",
+                body=(
+                    f"Flagged this eval: {names}. AgentRotator benches these "
+                    f"(except PROTECTED_AGENTS) with MIN_ACTIVE_AGENTS floor "
+                    f"and early-REACTIVATES any benched agent whose 20d P&L "
+                    f"has recovered above $0."
+                ),
+                tags=["auto_rotate"],
+            ))
+        recovered = [
+            a for a in benched
+            if a.pnl_20d > 0 and a.trades_20d >= 10 and a.name != "CryptoAgent"
+        ]
+        for a in recovered:
+            recs.append(Recommendation(
+                severity="action",
+                title=f"Reactivate {a.name} (recovered)",
+                body=(
+                    f"`{a.name}` is benched but 20d P&L is ${a.pnl_20d:+,.2f} "
+                    f"on {a.trades_20d} trades. Safe auto-reactivate."
+                ),
+                tags=["auto_reactivate", a.name],
+            ))
+        # Structural: persistent loser with no variant — log for human
+        from agent_rotator import AGENT_VARIANTS, PROTECTED_AGENTS
+        for a in flagged:
+            if a.name in PROTECTED_AGENTS or a.name == "CryptoAgent":
+                continue
+            if a.pnl_20d < -200 and a.name not in AGENT_VARIANTS:
+                recs.append(Recommendation(
+                    severity="info",
+                    title=f"Create variant for {a.name}",
+                    body=(
+                        f"`{a.name}` is flagged with 20d P&L ${a.pnl_20d:+,.2f} "
+                        f"and has no AGENT_VARIANTS entry. Rotator can bench it "
+                        f"but cannot substitute a tuned clone. **Human review:** "
+                        f"add a conservative variant module and register it in "
+                        f"`ensemble.py` + `AGENT_VARIANTS`."
+                    ),
+                    tags=["human_create", a.name],
+                ))
+        return recs
+
+    def _write_auto_actions(self, report, recs: list[Recommendation]) -> None:
+        """Machine-readable proposals. Rotator alone executes FLAG benches
+        (MIN_ACTIVE floor + replacement). Improver does not auto-BENCH."""
+        auto = []
+        human = []
+        for r in recs:
+            if "auto_reactivate" in r.tags or "auto_promote" in r.tags:
+                agent = next((t for t in r.tags if t.endswith("Agent")), None)
+                if agent:
+                    auto.append({
+                        "action": "REACTIVATE",
+                        "agent": agent,
+                        "reason": r.title,
+                    })
+            elif "human_create" in r.tags or (
+                r.severity == "action"
+                and "auto_reactivate" not in r.tags
+                and "auto_promote" not in r.tags
+            ):
+                human.append({"title": r.title, "body": r.body, "tags": r.tags})
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "generated_at": report.generated_at,
+            "auto": auto,
+            "human": human,
+        }
+        AUTO_ACTIONS.write_text(json.dumps(payload, indent=2))
+
+    def _append_learning_log(self, report, recs, path: Path) -> None:
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "top_agent": report.top_agent,
+            "flagged": list(report.flagged_agents),
+            "rec_count": len(recs),
+            "titles": [r.title for r in recs],
+            "markdown": str(path),
+        }
+        with open(LEARNING_LOG, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
     # ── Persistence helpers ─────────────────────────────────────────────────
 
     def _append_eval_history(self, report) -> None:
@@ -378,9 +478,9 @@ class ImproverAgent:
             "",
             "## How to apply",
             "",
-            "- **Retire an agent:** add the name to `DISABLED_AGENTS` in "
-            "`agent_rotator.py`, then mark it inactive in `logs/agent_summary.json` "
-            "with `\"benched_at\": \"2099-01-01T00:00:00+00:00\"`.",
+            "- **Crypto sleeve:** `CRYPTO_TRADING_ENABLED=False` and "
+            "`CryptoAgent.generate_signals()` returns `[]`. That is not a "
+            "rotator DISABLED event. Recovered sit-outs are **REACTIVATED**.",
             "- **Add a variant:** drop the new agent module in the project root, "
             "register it in `ensemble.py`, and add an entry to `AGENT_VARIANTS` "
             "in `agent_rotator.py` so the rotator can promote it.",

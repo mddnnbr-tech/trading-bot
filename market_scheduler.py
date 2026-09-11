@@ -36,6 +36,11 @@ except ImportError:
 
 from agent_evaluator import AgentEvaluator
 from agent_rotator   import AgentRotator
+from session_gates   import (
+    assert_paper_only,
+    is_after_hours_monitor_window,
+    is_rth,
+)
 
 # ── Config ───────────────────────────────────────────────────────────────────
 ET              = ZoneInfo("America/New_York")
@@ -78,21 +83,8 @@ signal.signal(signal.SIGINT,  _handle_shutdown)
 # ── Market hours helpers ──────────────────────────────────────────────────────
 
 def is_market_open(now: datetime) -> bool:
-    """True if 'now' (timezone-aware) is within NYSE trading hours."""
-    if now.weekday() >= 5:   # Saturday=5, Sunday=6
-        return False
-
-    # Holiday check (requires pandas_market_calendars)
-    if _CALENDAR_AVAILABLE:
-        date_str = now.strftime("%Y-%m-%d")
-        schedule = _NYSE.schedule(start_date=date_str, end_date=date_str)
-        if schedule.empty:
-            return False   # holiday
-
-    market_open  = now.replace(hour=MARKET_OPEN[0],  minute=MARKET_OPEN[1],  second=0, microsecond=0)
-    market_close = now.replace(hour=MARKET_CLOSE[0], minute=MARKET_CLOSE[1], second=0, microsecond=0)
-
-    return market_open <= now < market_close
+    """True if 'now' is within NYSE regular trading hours (RTH)."""
+    return is_rth(now)
 
 
 def is_eval_time(now: datetime) -> bool:
@@ -143,7 +135,15 @@ def run_agent_tick():
 
 
 def post_daily_slack_summary():
-    """Post end-of-day summary to Slack #trading-alerts at 3:55 PM ET."""
+    """DISABLED by default — no daily Slack dump to #trading-alerts.
+
+    Set ENABLE_SLACK_SUMMARY=true only if you explicitly want the old
+    noisy EOD ping. Health-check CRITICAL alerts are a separate path.
+    """
+    flag = os.getenv("ENABLE_SLACK_SUMMARY", "false").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        log.info("Slack daily summary OFF (ENABLE_SLACK_SUMMARY!=true) — no trading noise")
+        return
     if not SLACK_WEBHOOK:
         log.debug("SLACK_WEBHOOK_URL not set — skipping daily summary")
         return
@@ -232,54 +232,16 @@ def post_daily_slack_summary():
 
 
 def send_daily_email():
-    """Send end-of-day recap email via Gmail SMTP."""
-    try:
-        import smtplib, json
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.text import MIMEText
-        gmail   = os.getenv("GMAIL_ADDRESS", "")
-        pw      = os.getenv("GMAIL_APP_PASSWORD", "")
-        to      = os.getenv("REPORT_TO_EMAIL", gmail)
-        if not gmail or not pw:
-            log.debug("Gmail creds not set — skipping email")
-            return
-        import trade_ledger as _ledger
-        trades   = _ledger.all_trades()
-        today    = datetime.now(ET).strftime("%Y-%m-%d")
-        today_t  = [t for t in trades if t.opened_at_et.startswith(today)]
-        open_t   = [t for t in today_t if t.is_open]
-        closed_t = [t for t in today_t if not t.is_open]
-        realized = sum(t.realized_pnl or 0 for t in closed_t)
-        unreal   = sum(t.unrealized_pnl or 0 for t in open_t)
-        rows = "".join(
-            f"<tr><td>{t.symbol}</td><td>{t.side}</td>"
-            f"<td>${t.entry_price:.2f}</td><td>{t.status}</td>"
-            f"<td style='color:{'green' if (t.realized_pnl or t.unrealized_pnl or 0)>=0 else 'red'}'>"
-            f"${(t.realized_pnl or t.unrealized_pnl or 0):+.2f}</td></tr>"
-            for t in today_t
-        )
-        html = f"""<html><body>
-        <h2>BluSterling Trading Bot — {datetime.now(ET).strftime('%b %d, %Y')}</h2>
-        <p><b>Realized P&L:</b> <span style="color:{'green' if realized>=0 else 'red'}">${realized:+.2f}</span> &nbsp;
-           <b>Unrealized:</b> ${unreal:+.2f} &nbsp;
-           <b>Trades today:</b> {len(today_t)}</p>
-        <table border="1" cellpadding="4" style="border-collapse:collapse">
-        <tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Status</th><th>P&L</th></tr>
-        {rows if rows else '<tr><td colspan=5>No trades today</td></tr>'}
-        </table>
-        <p style="color:gray;font-size:12px">BluSterling & Associates LLC — paper trading</p>
-        </body></html>"""
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Trading Bot — {datetime.now(ET).strftime('%b %d')} | P&L ${realized:+.2f}"
-        msg["From"]    = gmail
-        msg["To"]      = to
-        msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(gmail, pw)
-            s.sendmail(gmail, to, msg.as_string())
-        log.info(f"Daily recap email sent to {to}")
-    except Exception as e:
-        log.warning(f"Email send failed: {e}")
+    """Retired duplicate sender.
+
+    The only daily email is ``daily_reporter.py --send-now`` (NYSE session
+    days, gated by ENABLE_DAILY_EMAIL). Do not call this from cron.
+    """
+    log.info(
+        "send_daily_email() is a no-op — duplicate path killed. "
+        "Use daily_reporter.py --send-now (ENABLE_DAILY_EMAIL)."
+    )
+    return
 
 
 def sync_alpaca_positions():
@@ -384,7 +346,13 @@ def run_learning_cycle():
 _eval_done_this_window: set[str] = set()
 
 def run_eval_cycle():
-    """Run evaluation + rotation. Called twice per market day."""
+    """Run evaluation + rotation + improver. Called twice per market day.
+
+    Rotation ALWAYS runs (not only when someone is flagged) so benched
+    agents can expire/reactivate and recovered agents can be promoted.
+    Improver writes auto_actions.json for the rotator and a markdown
+    file of structural ideas for human review.
+    """
     log.info("═" * 60)
     log.info("Starting evaluation and rotation cycle...")
     try:
@@ -393,16 +361,54 @@ def run_eval_cycle():
         evaluator.save_report(report)
         log.info("\n" + report.summary_text())
 
-        if report.flagged_agents:
-            log.info(f"Flagged agents detected: {report.flagged_agents} — running rotation...")
-            rotator = AgentRotator()
-            result  = rotator.run_rotation()
-            log.info(f"Rotation actions: {result['actions']}")
-        else:
-            log.info("All agents within performance threshold — no rotation needed.")
+        rotator = AgentRotator()
+        result  = rotator.run_rotation()
+        log.info(f"Rotation actions: {result['actions'] or ['none']}")
     except Exception as e:
         log.error(f"Evaluation cycle error: {e}", exc_info=True)
+    try:
+        from improver_agent import ImproverAgent
+        path = ImproverAgent().run()
+        log.info(f"Improver recommendations → {path}")
+    except Exception as e:
+        log.error(f"Improver cycle error: {e}", exc_info=True)
     log.info("═" * 60)
+
+
+def run_after_hours_monitor():
+    """Monitor / heal / prepare only — no new equity entries.
+
+    Runs on session days outside 09:30–16:00 ET: refresh ledger, close
+    ghosts, resubmit missing trails, manage option exits, and run crypto
+    EXIT checks without opening new BTC/ETH/SOL.
+    """
+    log.info("AH monitor: heal/prepare only (no new equity entries)")
+    try:
+        import trade_ledger as _ledger
+        sync = _ledger.sync_from_broker()
+        ghosts = _ledger.close_ghosts()
+        refresh = _ledger.refresh_open_positions()
+        log.info(f"AH ledger: sync={sync} ghosts={ghosts} refresh={refresh}")
+    except Exception as e:
+        log.warning(f"AH ledger heal failed: {e}")
+    try:
+        from options_executor import manage_options_exits
+        manage_options_exits()
+    except Exception as e:
+        log.debug(f"AH options exits: {e}")
+    try:
+        from order_executor import widen_trails_on_survivors, ensure_protective_exits
+        widen_trails_on_survivors()
+        healed = ensure_protective_exits()
+        if healed.get("protected") or healed.get("failed") or healed.get("still_naked"):
+            log.info(f"AH heal trails: {healed}")
+    except Exception as e:
+        log.warning(f"AH trail heal failed: {e}")
+    try:
+        from crypto_scheduler import manage_crypto_exits
+        manage_crypto_exits()
+    except Exception as e:
+        log.debug(f"AH crypto exits: {e}")
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -411,8 +417,14 @@ def main():
     log.info("╔══════════════════════════════════════════════════╗")
     log.info("║     Trading Bot Market Scheduler — Starting      ║")
     log.info("╚══════════════════════════════════════════════════╝")
-    log.info(f"Market hours: {MARKET_OPEN[0]:02d}:{MARKET_OPEN[1]:02d} – "
+    try:
+        assert_paper_only("market_scheduler")
+    except RuntimeError as e:
+        log.critical(str(e))
+        sys.exit(1)
+    log.info(f"PAPER ONLY  |  Market hours: {MARKET_OPEN[0]:02d}:{MARKET_OPEN[1]:02d} – "
              f"{MARKET_CLOSE[0]:02d}:{MARKET_CLOSE[1]:02d} ET  |  Tick: {TICK_SECONDS}s")
+    log.info("Crypto sleeve DISABLED — no new BTC/ETH/SOL entries")
 
     global _running
     last_tick_minute = -1
@@ -444,10 +456,7 @@ def main():
 
             # ── Daily Slack summary at 3:55 PM ET ────────────────────────
             # Email is deliberately NOT sent here — daily_reporter.py's cron
-            # job at 4:35 PM sends the one comprehensive daily email. Sending
-            # both meant two emails a day covering overlapping info, which
-            # was the actual cause of notification overload (not a missing
-            # setting). One Slack ping + one email per day, that's it.
+            # job at 4:35 PM sends the one comprehensive daily email.
             summary_key = f"summary_{now.date()}"
             if (now.hour == SUMMARY_TIME_ET[0]
                     and now.minute == SUMMARY_TIME_ET[1]
@@ -456,10 +465,18 @@ def main():
                 post_daily_slack_summary()
                 sync_alpaca_positions()
 
+        elif is_after_hours_monitor_window(now):
+            current_minute = now.hour * 60 + now.minute
+            if current_minute != last_tick_minute and now.minute % 5 == 0:
+                last_tick_minute = current_minute
+                run_after_hours_monitor()
+            time.sleep(TICK_SECONDS)
+            continue
+
         else:
-            # Outside market hours — sleep longer to conserve resources
+            # Weekend / holiday / overnight — sleep longer
             now_str = now.strftime("%a %Y-%m-%d %H:%M ET")
-            if now.second < TICK_SECONDS:  # log once per tick period
+            if now.second < TICK_SECONDS:
                 log.debug(f"Market closed ({now_str}) — waiting...")
             time.sleep(TICK_SECONDS * 5)
             continue

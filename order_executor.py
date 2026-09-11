@@ -145,7 +145,14 @@ class OrderExecutor:
                      f"failed, retrying in ~{remaining}m")
             return {"status": "cooldown", "symbol": symbol, "direction": direction}
 
-        is_crypto = symbol in CRYPTO_SYMBOLS
+        from session_gates import assert_paper_only, equity_entries_allowed, is_crypto_symbol
+        assert_paper_only("OrderExecutor.execute")
+        allowed, reason = equity_entries_allowed(symbol=symbol)
+        if not allowed:
+            log.info(f"⏭  BLOCKED ENTRY: {symbol} {direction.upper()} — {reason}")
+            return {"status": "blocked", "symbol": symbol, "direction": direction, "reason": reason}
+
+        is_crypto = is_crypto_symbol(symbol) or symbol in CRYPTO_SYMBOLS
 
         try:
             if is_crypto:
@@ -591,6 +598,11 @@ def widen_trails_on_survivors(min_days: float = 2.0,
             ensure_protective_exits()
         except Exception:
             pass
+
+
+def heal_unprotected_positions(trail_pct: float = 4.0) -> dict:
+    """Alias for ensure_protective_exits (harden ec855fb). Do not fork a second healer."""
+    return ensure_protective_exits()
 
 
 # ── Module-level singleton ────────────────────────────────────────────────────

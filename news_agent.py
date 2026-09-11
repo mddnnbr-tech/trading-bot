@@ -86,7 +86,7 @@ class NewsAgent:
     def generate_signals(self) -> list[dict]:
         """Return a list of raw signals ready for AgentRiskBridge."""
         if not _FEEDPARSER_AVAILABLE:
-            log.error("feedparser not installed — NewsAgent cannot run.")
+            log.warning("feedparser not installed — NewsAgent standing down this tick")
             return []
 
         signals = []

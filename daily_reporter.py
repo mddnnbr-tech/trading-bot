@@ -1,31 +1,16 @@
 """
-daily_reporter.py — v2.1 (2026-04-22)
-─────────────────────────────────────
-Daily trading performance email, fired at 4:35 PM ET on weekdays.
+daily_reporter.py — one market-day PAPER scorecard (not the old v2 dump).
 
-v2.1 — adds segmented Performance Tracking (Paper/Test vs. Actual/Live):
-  • Shadow P&L engine — calculates "what would my P&L be if every approved
-    signal had filled at signal time and was still held now". Pulls entry
-    prices from yfinance at signal timestamp; current price from yfinance
-    last close. Surfaces winners/losers and per-agent shadow P&L.
-  • Forward-compatible LIVE column — pre-wired to read from
-    `logs/live_fills.jsonl` when Phase B / live trading is wired. Today
-    it's a STANDBY placeholder; on go-live it auto-populates without
-    further code changes.
-  • Mode badge — "PAPER (TEST) ● ACTIVE" vs. "ACTUAL (LIVE) ○ STANDBY"
-    based on TRADING_MODE / PAPER_TRADING env vars.
+Sends only on NYSE regular-session days (Mon–Fri, skip US market holidays).
+Weekends/holidays: exit 0 with a skip log. No Slack copy of this email.
 
-v2 — fixed the critical "report shows 0 trades while bot fires 50+/day" bug:
-  • Reads the actual `event` field (SIGNAL_APPROVED / SIGNAL_REJECTED) in
-    trade_log.jsonl. v1 looked for a nonexistent `status` field → always 0.
-  • Properly converts trade_log UTC timestamps → ET before date-matching.
-  • Parses scheduler.log directly for: tick count, fetch errors, raw signal
-    counts, MetaAgent synthesis output.
-  • Sections: Approved Trades, Rejection Reasons, Per-Agent Activity,
-    Fetch Errors, Tick Health, System Diagnosis.
+Kill switches (VM .env):
+  ENABLE_DAILY_EMAIL=false     silence this email entirely (default: true)
+  ENABLE_SLACK_SUMMARY=false   daily Slack dump stays OFF (default: false)
 
-Cron entry (no change required):
+Cron (single sender — remove send_recap_email.py ~16:30 if still present):
     35 16 * * 1-5  /usr/bin/python3 /home/mddnnbr/tading-bot/daily_reporter.py --send-now
+The 1-5 crontab still fires on NYSE holidays; this script no-ops those days.
 """
 
 from __future__ import annotations
@@ -70,6 +55,203 @@ ET = ZoneInfo("America/New_York")
 GMAIL_ADDRESS   = os.getenv("GMAIL_ADDRESS", "")
 GMAIL_APP_PW    = os.getenv("GMAIL_APP_PASSWORD", "")
 REPORT_TO_EMAIL = os.getenv("REPORT_TO_EMAIL", GMAIL_ADDRESS)
+
+# Kill switches. ENABLE_DAILY_EMAIL defaults ON because this file *is*
+# the replacement scorecard. Set false on the VM to silence email.
+# ENABLE_SLACK_SUMMARY defaults OFF — no duplicate trading dump to Slack.
+def _env_on(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+ENABLE_DAILY_EMAIL = _env_on("ENABLE_DAILY_EMAIL", "true")
+ENABLE_SLACK_SUMMARY = _env_on("ENABLE_SLACK_SUMMARY", "false")
+
+
+def daily_email_enabled() -> bool:
+    return _env_on("ENABLE_DAILY_EMAIL", "true")
+
+
+def is_open_market_report_day(now: datetime | None = None) -> bool:
+    """True only on US equity RTH session days (Mon–Fri, not NYSE holidays)."""
+    try:
+        from session_gates import is_nyse_session_day
+        return is_nyse_session_day(now)
+    except Exception:
+        now = now or datetime.now(ET)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=ET)
+        return now.weekday() < 5
+
+
+def skip_send_reason(*, send_now: bool) -> str | None:
+    """Why --send-now should no-op. None means sending is allowed."""
+    if not send_now:
+        return None
+    if not daily_email_enabled():
+        return "ENABLE_DAILY_EMAIL=false — daily email kill switch; not sending"
+    if not is_open_market_report_day():
+        return "skip — market closed (weekend or NYSE holiday)"
+    return None
+
+
+def format_email_subject(snap: dict | None = None, date: str | None = None) -> str:
+    """[PAPER] Market day — YYYY-MM-DD — equity $X (day ±Y%)"""
+    snap = snap or {}
+    date = date or snap.get("today") or _today_et().strftime("%Y-%m-%d")
+    eq = snap.get("equity")
+    prev = snap.get("prev_close")
+    if eq is None:
+        return f"[PAPER] Market day — {date} — equity n/a"
+    day_pct = ((float(eq) / float(prev)) - 1) * 100 if prev else 0.0
+    sign = "+" if day_pct >= 0 else ""
+    return f"[PAPER] Market day — {date} — equity ${float(eq):,.0f} (day {sign}{day_pct:.2f}%)"
+
+
+def _read_json(path: Path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception:
+        pass
+    return default
+
+
+def _rotations_today(today: str) -> list[dict]:
+    path = LOGS_DIR / "rotation_log.jsonl"
+    rows: list[dict] = []
+    if not path.exists():
+        return rows
+    try:
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            ts = str(rec.get("timestamp") or "")
+            if today in ts:
+                rows.append(rec)
+    except Exception:
+        return rows
+    return rows
+
+
+def _load_meta_weights() -> dict:
+    try:
+        from meta_agent import MetaAgent
+        return dict(MetaAgent._load_performance_weights() or {})
+    except Exception:
+        try:
+            from meta_agent import DEFAULT_WEIGHTS
+            return dict(DEFAULT_WEIGHTS)
+        except Exception:
+            return {}
+
+
+def scorecard_agent_roster(d: dict | None = None) -> list[dict]:
+    """Full roster: status active|benched, MetaAgent weight, P&L.
+
+    Tests (and callers) may pass ``d['agent_roster']`` to skip disk/ledger.
+    """
+    d = d or {}
+    if "agent_roster" in d:
+        return list(d.get("agent_roster") or [])
+    try:
+        from meta_agent import DEFAULT_WEIGHTS
+        names = list(DEFAULT_WEIGHTS)
+    except Exception:
+        names = []
+    summary = _read_json(LOGS_DIR / "agent_summary.json", {})
+    eval_data = _read_json(LOGS_DIR / "latest_eval.json", {})
+    eval_agents = {
+        a.get("name"): a
+        for a in (eval_data.get("agents") or [])
+        if isinstance(a, dict) and a.get("name")
+    }
+    if isinstance(summary, dict):
+        for name in summary:
+            if name not in names:
+                names.append(name)
+    for name in eval_agents:
+        if name not in names:
+            names.append(name)
+    weights = _load_meta_weights()
+    skip = {"MetaAgent", "BrokerSync"}
+    roster = []
+    for name in names:
+        if name in skip:
+            continue
+        info = summary.get(name) if isinstance(summary, dict) else {}
+        if not isinstance(info, dict):
+            info = {}
+        ev = eval_agents.get(name) or {}
+        if "active" in info:
+            status = "active" if info.get("active", True) else "benched"
+        elif "active" in ev:
+            status = "active" if ev.get("active", True) else "benched"
+        else:
+            status = "active"
+        pnl = info.get("total_pnl")
+        if pnl is None:
+            pnl = ev.get("pnl_20d") or ev.get("pnl_alltime") or 0.0
+        w = weights.get(name)
+        if w is None:
+            w = 1.0 if status == "active" else 0.15
+        roster.append({
+            "name": name,
+            "status": status,
+            "weight": float(w),
+            "pnl": float(pnl or 0),
+        })
+    roster.sort(key=lambda r: r["pnl"], reverse=True)
+    return roster
+
+
+def scorecard_rotation_actions(today: str, d: dict | None = None) -> dict[str, list[str]]:
+    """Today's FLAG / BENCHED / PROMOTED / REACTIVATED (always all four keys).
+
+    FLAG comes from rotation_log AND evaluator ``latest_eval.json`` /
+    ``d['flagged_today']`` so a FLAG that was not yet written to the log
+    still renders on the scorecard.
+    """
+    d = d or {}
+    buckets = {"FLAG": [], "BENCHED": [], "PROMOTED": [], "REACTIVATED": []}
+    if "rotation_actions" in d:
+        src = d.get("rotation_actions") or {}
+        for k in buckets:
+            buckets[k] = list(src.get(k) or [])
+        extra = list(d.get("flagged_today") or [])
+        have = " ".join(buckets["FLAG"]).lower()
+        for name in extra:
+            if name and name.lower() not in have:
+                buckets["FLAG"].append(str(name))
+                have += " " + name.lower()
+        return buckets
+
+    for rec in _rotations_today(today):
+        ev = str(rec.get("event") or "").upper()
+        if ev not in buckets:
+            continue
+        label = rec.get("description") or rec.get("agent") or ev
+        if rec.get("agent") and rec["agent"] not in str(label):
+            label = f"{rec['agent']} — {label}"
+        buckets[ev].append(str(label))
+
+    flagged = list(d.get("flagged_today") or [])
+    eval_data = _read_json(LOGS_DIR / "latest_eval.json", {})
+    gen = str(eval_data.get("generated_at") or "")
+    if not flagged and today in gen:
+        flagged = list(eval_data.get("flagged_agents") or [])
+        for a in eval_data.get("agents") or []:
+            if isinstance(a, dict) and a.get("flagged") and a.get("name"):
+                if a["name"] not in flagged:
+                    flagged.append(a["name"])
+    existing = " ".join(buckets["FLAG"]).lower()
+    for name in flagged:
+        if name and name.lower() not in existing:
+            buckets["FLAG"].append(str(name))
+            existing += " " + name.lower()
+    return buckets
+
 
 # This bot is paper-only. TRADING_MODE=live / PAPER_TRADING=false cannot
 # flip the report into a live column — that is how a paper loss got
@@ -668,6 +850,14 @@ class DailyReporter:
             "agent_attribution":    agent_attribution,
             "open_positions_full":  [_ledger_position_to_dict(t) for t in open_pos_list] if _LEDGER_AVAILABLE else [],
         }
+        try:
+            from report_data import snapshot as _snap
+            report["snapshot"] = _snap()
+            opened = report["snapshot"].get("opened_today") or []
+            if opened:
+                report["approved_count"] = len(opened)
+        except Exception:
+            report["snapshot"] = {}
         report["findings"] = diagnose(report)
         return report
 
@@ -1197,195 +1387,179 @@ class DailyReporter:
             '</tr></thead><tbody>' + rows + '</tbody></table>'
         )
 
-    def format_email_html(self, d: dict) -> str:
-        sched = d["sched"]
-        pnl_color = "#22c55e" if d["total_pnl"] >= 0 else "#ef4444"
-        pnl_sign  = "+" if d["total_pnl"] >= 0 else ""
+    def format_email_html(self, d: dict, snap: dict | None = None) -> str:
+        """Short PAPER scorecard — not the old v2 diagnose dump."""
+        sched = d.get("sched") or {}
+        if snap is None:
+            snap = d.get("snapshot") or {}
 
-        # ─── Performance Tracking — Paper (shadow) vs. Live (actual) ──────────
-        perf_html = self._format_performance_panel(d)
+        def clr(v):
+            return "#22c55e" if (v or 0) >= 0 else "#ef4444"
 
-        # ─── v2.2 ledger-backed sections ──────────────────────────────────────
-        daily_trends_html  = self._format_daily_trends_section(d)
-        portfolio_html     = self._format_portfolio_section(d)
-        agent_eval_html    = self._format_agent_evaluator_section(d)
-        open_positions_html = self._format_open_positions_section(d)
-
-        # Ledger status banner — surfaces parsing/refresh problems immediately
-        ls = d.get("ledger_status") or {}
-        if not ls.get("available"):
-            ledger_banner = (
-                '<div style="background:#fef2f2;padding:10px 14px;border-radius:6px;'
-                'margin-bottom:6px;font-size:13px;border-left:3px solid #ef4444">'
-                '⚠️  trade_ledger module not loaded on the VM. '
-                'Upload <code>trade_ledger.py</code> next to <code>daily_reporter.py</code> '
-                'to enable Daily Trends, Portfolio, and Agent Evaluator sections.'
-                '</div>'
-            )
-        elif ls.get("error"):
-            ledger_banner = (
-                f'<div style="background:#fffbeb;padding:10px 14px;border-radius:6px;'
-                f'margin-bottom:6px;font-size:13px;border-left:3px solid #f59e0b">'
-                f'⚠️  Ledger refresh had a partial error: <code>{ls["error"][:200]}</code>'
-                f'</div>'
-            )
-        else:
-            r = ls.get("refresh") or {}
-            ledger_banner = (
-                f'<div style="background:#f0fdf4;padding:8px 14px;border-radius:6px;'
-                f'margin-bottom:6px;font-size:12px;color:#15803d">'
-                f'📒 Ledger: {ls["total"]} trades total (+{ls["added"]} new this run). '
-                f'Open-position refresh: {r.get("checked", 0)} checked, '
-                f'{r.get("closed_target", 0)} hit target, '
-                f'{r.get("closed_stop", 0)} hit stop, '
-                f'{r.get("expired", 0)} expired, '
-                f'{r.get("still_open", 0)} still open.'
-                f'</div>'
-            )
-
-        # Findings panel (top of email — most important)
-        findings_html = ""
-        for f in d["findings"]:
-            bg = "#fef2f2" if f.startswith("⚠️") else (
-                "#eff6ff" if f.startswith("ℹ️") else (
-                "#fffbeb" if f.startswith("💡") else
-                "#f0fdf4" if f.startswith("✅") else "#f1f5f9"))
-            findings_html += f'<div style="background:{bg};padding:10px 14px;border-radius:6px;margin-bottom:6px;font-size:13px">{f}</div>'
-
-        # Approved trades table
-        if d["approved_trades"]:
-            rows = ""
-            for t in d["approved_trades"][:50]:
-                conf_s = f"{t['confidence']:.2f}" if t["confidence"] is not None else "—"
-                risk_s = f"${t['risk_dollar']:,.0f}" if t["risk_dollar"] is not None else "—"
-                dir_color = "#22c55e" if str(t["direction"]).lower() == "long" else "#ef4444"
-                rows += (f'<tr><td style="padding:6px 10px;font-size:12px">{t["time"]}</td>'
-                         f'<td style="padding:6px 10px;font-weight:600">{t["symbol"]}</td>'
-                         f'<td style="padding:6px 10px;color:{dir_color};font-weight:600">{t["direction"]}</td>'
-                         f'<td style="padding:6px 10px;text-align:right">{conf_s}</td>'
-                         f'<td style="padding:6px 10px;text-align:right">{risk_s}</td>'
-                         f'<td style="padding:6px 10px;font-size:11px;color:#64748b">{t["agent"]}</td></tr>')
-            approved_html = f'<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#1e293b;color:#fff"><th style="padding:8px 10px;text-align:left">Time</th><th style="padding:8px 10px;text-align:left">Symbol</th><th style="padding:8px 10px;text-align:left">Side</th><th style="padding:8px 10px;text-align:right">Conf</th><th style="padding:8px 10px;text-align:right">Risk $</th><th style="padding:8px 10px;text-align:left">Agent</th></tr></thead><tbody>{rows}</tbody></table>'
-            if len(d["approved_trades"]) > 50:
-                approved_html += f'<p style="font-size:12px;color:#64748b;margin:6px 0 0">Showing first 50 of {len(d["approved_trades"])} approved trades.</p>'
-        else:
-            approved_html = '<p style="color:#94a3b8;font-style:italic">No approved trades today.</p>'
-
-        # Rejection reasons
-        if d["rejection_reasons"]:
-            rrows = ""
-            for reason, count in sorted(d["rejection_reasons"].items(), key=lambda x: -x[1])[:10]:
-                rrows += (f'<tr><td style="padding:6px 10px;font-size:12px">{reason[:120]}</td>'
-                          f'<td style="padding:6px 10px;text-align:right;font-weight:700">{count}</td></tr>')
-            reject_html = f'<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#1e293b;color:#fff"><th style="padding:8px 10px;text-align:left">Reason</th><th style="padding:8px 10px;text-align:right">Count</th></tr></thead><tbody>{rrows}</tbody></table>'
-        else:
-            reject_html = '<p style="color:#94a3b8;font-style:italic">No rejections today.</p>'
-
-        # Per-agent activity
-        if d["agent_activity"]:
-            arows = ""
-            for agent, stats in sorted(d["agent_activity"].items(), key=lambda x: -x[1]["total"])[:25]:
-                arows += (f'<tr><td style="padding:6px 10px;font-size:12px;font-weight:600">{agent[:60]}</td>'
-                          f'<td style="padding:6px 10px;text-align:right;color:#22c55e">{stats["approved"]}</td>'
-                          f'<td style="padding:6px 10px;text-align:right;color:#ef4444">{stats["rejected"]}</td>'
-                          f'<td style="padding:6px 10px;text-align:right">{stats["total"]}</td></tr>')
-            agents_html = f'<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#1e293b;color:#fff"><th style="padding:8px 10px;text-align:left">Agent</th><th style="padding:8px 10px;text-align:right">✓</th><th style="padding:8px 10px;text-align:right">✗</th><th style="padding:8px 10px;text-align:right">Total</th></tr></thead><tbody>{arows}</tbody></table>'
-        else:
-            agents_html = '<p style="color:#94a3b8;font-style:italic">No agent activity recorded today.</p>'
-
-        # Fetch errors
-        if sched["fetch_404_symbols"]:
-            err_items = sorted(sched["fetch_404_symbols"].items(), key=lambda x: -x[1])[:15]
-            err_html = '<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#1e293b;color:#fff"><th style="padding:8px 10px;text-align:left">Symbol</th><th style="padding:8px 10px;text-align:right">404 count</th></tr></thead><tbody>'
-            for sym, cnt in err_items:
-                err_html += f'<tr><td style="padding:6px 10px">{sym}</td><td style="padding:6px 10px;text-align:right;font-weight:700">{cnt}</td></tr>'
-            err_html += '</tbody></table>'
-            err_html += f'<p style="font-size:12px;color:#64748b;margin:6px 0 0">Total errors today: {sched["error_count"]:,}</p>'
-        else:
-            err_html = '<p style="color:#94a3b8;font-style:italic">No fetch errors today.</p>'
-
-        # Tick health
-        tick_pct = (sched["tick_count"] / 390 * 100) if sched["tick_count"] else 0
-        tick_color = "#22c55e" if tick_pct >= 80 else ("#f59e0b" if tick_pct >= 30 else "#ef4444")
-        tick_html = (
-            f'<table style="width:100%;border-collapse:collapse;font-size:13px"><tbody>'
-            f'<tr><td style="padding:6px 10px;font-weight:600">Ticks observed</td>'
-            f'<td style="padding:6px 10px;text-align:right;color:{tick_color};font-weight:700">{sched["tick_count"]:,} / ~390 ({tick_pct:.0f}%)</td></tr>'
-            f'<tr><td style="padding:6px 10px;font-weight:600">First log entry</td>'
-            f'<td style="padding:6px 10px;text-align:right;font-family:monospace;font-size:12px">{sched.get("first_log") or "—"}</td></tr>'
-            f'<tr><td style="padding:6px 10px;font-weight:600">Last log entry</td>'
-            f'<td style="padding:6px 10px;text-align:right;font-family:monospace;font-size:12px">{sched.get("last_log") or "—"}</td></tr>'
-            f'<tr><td style="padding:6px 10px;font-weight:600">Raw signals (peak tick)</td>'
-            f'<td style="padding:6px 10px;text-align:right;font-weight:700">{d.get("raw_signals_total", 0)}</td></tr>'
-            f'<tr><td style="padding:6px 10px;font-weight:600">Passed synthesis (peak)</td>'
-            f'<td style="padding:6px 10px;text-align:right;font-weight:700">{d.get("passed_synthesis", 0)}</td></tr>'
-            f'</tbody></table>'
+        eq = snap.get("equity")
+        day = snap.get("day_pnl")
+        day_pct = 0.0
+        if eq and snap.get("prev_close"):
+            day_pct = (float(eq) / float(snap["prev_close"]) - 1) * 100
+        eq_html = "n/a" if eq is None else f"${eq:,.0f}"
+        day_html = "n/a" if day is None else (
+            f'<span style="color:{clr(day)}">${day:+,.0f} ({day_pct:+.2f}%)</span>'
         )
 
-        # KPI cards
-        signals_card = f"{d['approved_count']}✓ / {d['rejected_count']}✗"
-        notional_card = f"${d['total_notional']:,.0f}"
+        windows = snap.get("windows") or []
+        by_label = {w.get("label"): w for w in windows if w.get("label")}
+        spy_order = ["1-day", "5-day", "Since start"]
+        if "20-day" in by_label:
+            spy_order = ["1-day", "5-day", "20-day", "Since start"]
+        wrows = ""
+        for label in spy_order:
+            w = by_label.get(label)
+            if not w:
+                wrows += (
+                    f'<tr><td style="padding:5px 8px">{label}</td>'
+                    f'<td style="padding:5px 8px;text-align:right">—</td>'
+                    f'<td style="padding:5px 8px;text-align:right">—</td>'
+                    f'<td style="padding:5px 8px;text-align:right">—</td></tr>'
+                )
+                continue
+            wrows += (
+                f'<tr><td style="padding:5px 8px">{w["label"]}</td>'
+                f'<td style="padding:5px 8px;text-align:right;color:{clr(w["bot_pct"])}">'
+                f'{w["bot_pct"]:+.2f}%</td>'
+                f'<td style="padding:5px 8px;text-align:right;color:{clr(w["spy_pct"])}">'
+                f'{w["spy_pct"]:+.2f}%</td>'
+                f'<td style="padding:5px 8px;text-align:right;color:{clr(w["edge"])};font-weight:700">'
+                f'{w["edge"]:+.2f}%</td></tr>'
+            )
+        spy_table = (
+            '<table style="width:100%;border-collapse:collapse;font-size:13px">'
+            '<thead><tr style="background:#1e293b;color:#fff">'
+            '<th style="padding:6px 8px;text-align:left">Window</th>'
+            '<th style="padding:6px 8px;text-align:right">Bot</th>'
+            '<th style="padding:6px 8px;text-align:right">SPY</th>'
+            '<th style="padding:6px 8px;text-align:right">Edge</th>'
+            '</tr></thead><tbody>'
+            + (wrows or '<tr><td colspan="4" style="padding:8px;color:#94a3b8">benchmarks unavailable</td></tr>')
+            + '</tbody></table>'
+        )
+
+        naked = snap.get("naked") or []
+        ghosts = snap.get("ghosts") or []
+        risk_html = (
+            f'Naked exits: <b>{len(naked)}</b>'
+            + (f' ({", ".join(naked[:6])})' if naked else " — protected")
+            + f' &nbsp;•&nbsp; Ledger ghosts: {len(ghosts)}'
+        )
+
+        today = snap.get("today") or d.get("today") or _today_et().strftime("%Y-%m-%d")
+        actions = scorecard_rotation_actions(today, d)
+        act_lines = []
+        for key in ("FLAG", "BENCHED", "PROMOTED", "REACTIVATED"):
+            items = actions.get(key) or []
+            body = "; ".join(items) if items else "none"
+            act_lines.append(
+                f'<div style="font-size:13px;margin:2px 0"><b>{key}:</b> {body}</div>'
+            )
+        rot_html = "".join(act_lines)
+
+        roster = scorecard_agent_roster(d)
+        if roster:
+            trows = "".join(
+                f'<tr><td style="padding:4px 8px;font-weight:600">{a["name"]}</td>'
+                f'<td style="padding:4px 8px">{a.get("status") or ("active" if a.get("active") else "benched")}</td>'
+                f'<td style="padding:4px 8px;text-align:right">{float(a.get("weight") or 0):.2f}</td>'
+                f'<td style="padding:4px 8px;text-align:right;color:{clr(a.get("pnl"))}">'
+                f'${float(a.get("pnl") or 0):+,.0f}</td></tr>'
+                for a in roster
+            )
+        else:
+            trows = (
+                '<tr><td colspan="4" style="padding:8px;color:#94a3b8">'
+                'no agent_summary.json / latest_eval.json yet</td></tr>'
+            )
+        roster_html = (
+            '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+            '<thead><tr style="background:#1e293b;color:#fff">'
+            '<th style="padding:6px 8px;text-align:left">Agent</th>'
+            '<th style="padding:6px 8px;text-align:left">Status</th>'
+            '<th style="padding:6px 8px;text-align:right">Weight</th>'
+            '<th style="padding:6px 8px;text-align:right">P&amp;L</th>'
+            '</tr></thead><tbody>' + trows + '</tbody></table>'
+        )
+
+        warns = snap.get("warnings") or []
+        crit = [w for w in warns if "CRITICAL" in str(w).upper()]
+        warn_html = ""
+        if crit:
+            warn_html = (
+                '<div style="background:#fef2f2;border-left:4px solid #ef4444;'
+                'padding:10px 12px;border-radius:6px;margin:8px 0;font-size:13px">'
+                + "<br>".join(crit[:4]) + "</div>"
+            )
 
         return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
   body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
          background:#f8fafc; margin:0; padding:0; color:#1e293b; }}
-  .wrapper {{ max-width:680px; margin:32px auto; background:#fff;
+  .wrapper {{ max-width:640px; margin:28px auto; background:#fff;
               border-radius:12px; box-shadow:0 2px 12px rgba(0,0,0,.08); overflow:hidden; }}
-  .header {{ background:#0f172a; padding:28px 32px; }}
-  .header h1 {{ color:#fff; margin:0; font-size:20px; font-weight:700; }}
+  .header {{ background:#0f172a; padding:22px 28px; }}
+  .header h1 {{ color:#fff; margin:0; font-size:18px; font-weight:700; }}
   .header p  {{ color:#94a3b8; margin:4px 0 0; font-size:13px; }}
   .paper-banner {{ background:#1d4ed8; color:#fff; text-align:center;
                    font-size:13px; font-weight:700; letter-spacing:.08em;
                    padding:10px 16px; text-transform:uppercase; }}
-  .body {{ padding:24px 32px; }}
-  .kpi-row {{ display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap; }}
-  .kpi {{ flex:1; min-width:110px; background:#f1f5f9; border-radius:8px;
-         padding:14px; text-align:center; }}
-  .kpi .val {{ font-size:20px; font-weight:700; }}
-  .kpi .lbl {{ font-size:11px; color:#64748b; margin-top:3px; }}
-  .section-title {{ font-size:14px; font-weight:700; color:#1e293b;
-                    margin:24px 0 8px; text-transform:uppercase;
+  .body {{ padding:20px 28px; }}
+  .section-title {{ font-size:12px; font-weight:700; color:#1e293b;
+                    margin:18px 0 6px; text-transform:uppercase;
                     letter-spacing:0.04em; }}
-  .footer {{ background:#f1f5f9; padding:14px 32px; font-size:11px;
+  .footer {{ background:#f1f5f9; padding:12px 28px; font-size:11px;
              color:#94a3b8; text-align:center; }}
 </style></head><body>
 <div class="wrapper">
   <div class="paper-banner">PAPER TRADING — Alpaca paper account — not live</div>
   <div class="header">
-    <h1>📊 BluSterling Daily Report</h1>
-    <p>{d['date_display']}  •  Generated {d['generated_at']}  •  Mode: <strong style="color:#93c5fd">PAPER</strong></p>
+    <h1>Market day scorecard</h1>
+    <p>{d.get('date_display') or today}  •  {d.get('generated_at') or ''}  •  Mode: <strong style="color:#93c5fd">PAPER</strong></p>
   </div>
   <div class="body">
-    {findings_html}
-    {self._format_intelligence_section(d)}
-
-    <div class="section-title">⏱  System Health</div>
+    {warn_html}
+    <div style="font-size:28px;font-weight:700">{eq_html}</div>
+    <div style="font-size:13px;color:#64748b;margin-bottom:12px">equity &nbsp;•&nbsp; day {day_html}</div>
+    <div class="section-title">Bot vs SPY</div>
+    {spy_table}
+    <div class="section-title">Open risk</div>
+    <p style="font-size:13px;color:#475569;margin:0">{risk_html}</p>
+    <div class="section-title">Today FLAG / BENCHED / PROMOTED / REACTIVATED</div>
+    {rot_html}
+    <div class="section-title">Agents (active / benched / weight / P&amp;L)</div>
+    {roster_html}
+    <div class="section-title">Errors / signals truth</div>
     <p style="font-size:13px;color:#475569;margin:0">
-      Ticks: {sched['tick_count']:,} / ~390 &nbsp;•&nbsp;
+      Ticks: {sched.get('tick_count', 0):,} / ~390 &nbsp;•&nbsp;
       System errors: {sched.get('system_error_count', 0):,} &nbsp;•&nbsp;
       Fetch/404s: {sched.get('fetch_error_count', 0):,}
-      &nbsp;•&nbsp; Entries today: {d['approved_count']}
+      &nbsp;•&nbsp; Entries today: {d.get('approved_count', 0)}
       &nbsp;•&nbsp; Peak raw signals: {d.get('raw_signals_total', 0)}
-      &nbsp;•&nbsp; Last log: {sched["last_log"] or "—"}
+      &nbsp;•&nbsp; Last log: {sched.get("last_log") or "—"}
     </p>
   </div>
   <div class="footer">
     BluSterling &amp; Associates LLC • PAPER TRADING only. Live trading is not enabled.<br>
-    Money: Alpaca paper broker via report_data.snapshot(). Ledger is attribution only.
+    One email on NYSE open days. Slack is CRITICAL heal failures only.
   </div>
 </div></body></html>"""
 
     # ── Send ──────────────────────────────────────────────────────────────────
 
     def send(self, html: str, subject: str | None = None) -> bool:
+        if not daily_email_enabled():
+            print("ENABLE_DAILY_EMAIL=false — skip send")
+            return True
         if not GMAIL_ADDRESS or not GMAIL_APP_PW:
             print("ERROR: GMAIL_ADDRESS or GMAIL_APP_PASSWORD not set in .env")
             return False
-        now = _today_et()
-        subject = subject or (
-            f"[PAPER] BluSterling Daily — {now.strftime('%b %-d, %Y')}"
-        )
+        subject = subject or format_email_subject()
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"]    = GMAIL_ADDRESS
@@ -1396,10 +1570,10 @@ class DailyReporter:
             with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as server:
                 server.login(GMAIL_ADDRESS, GMAIL_APP_PW)
                 server.sendmail(GMAIL_ADDRESS, REPORT_TO_EMAIL, msg.as_string())
-            print(f"✅  Daily report v2 sent to {REPORT_TO_EMAIL}")
+            print(f"Market-day scorecard sent to {REPORT_TO_EMAIL}: {subject}")
             return True
         except Exception as e:
-            print(f"❌  Failed to send email: {e}")
+            print(f"Failed to send email: {e}")
             return False
 
     def save_html(self, html: str) -> str:
@@ -1429,14 +1603,26 @@ def _crash_log(exc: BaseException) -> None:
 
 if __name__ == "__main__":
     try:
+        send_now = "--send-now" in sys.argv
+        reason = skip_send_reason(send_now=send_now)
+        if reason:
+            print(reason)
+            sys.exit(0)
         reporter = DailyReporter()
         data     = reporter.build_report()
         html     = reporter.format_email_html(data)
         reporter.save_html(html)
-        if "--send-now" in sys.argv:
-            ok = reporter.send(html)
+        if send_now:
+            snap = data.get("snapshot")
+            if snap is None:
+                try:
+                    from report_data import snapshot as _snap
+                    snap = _snap()
+                except Exception:
+                    snap = {}
+            subject = format_email_subject(snap)
+            ok = reporter.send(html, subject=subject)
             if not ok:
-                # Send returned False — credential or SMTP problem. Log it.
                 _crash_log(RuntimeError(
                     f"reporter.send() returned False. "
                     f"GMAIL_ADDRESS empty: {not GMAIL_ADDRESS}. "
@@ -1445,8 +1631,8 @@ if __name__ == "__main__":
                 ))
                 sys.exit(1)
         else:
-            print("Report generated (HTML saved). Pass --send-now to email it.")
+            print("Scorecard generated (HTML saved). Pass --send-now to email it.")
     except Exception as e:
         _crash_log(e)
-        print(f"❌  Reporter crashed: {e}", file=sys.stderr)
+        print(f"Reporter crashed: {e}", file=sys.stderr)
         sys.exit(1)
