@@ -72,15 +72,18 @@ class SlackAndDuplicateEmailOff(unittest.TestCase):
     def test_slack_summary_defaults_off(self):
         import market_scheduler as ms
         src = inspect.getsource(ms.post_daily_slack_summary)
-        self.assertIn('ENABLE_SLACK_SUMMARY', src)
-        self.assertIn('"false"', src)
-        with patch.dict(os.environ, {"ENABLE_SLACK_SUMMARY": "false",
+        self.assertFalse(ms.ENABLE_SLACK_SUMMARY)
+        self.assertEqual(ms.SLACK_WEBHOOK, "")
+        self.assertNotIn("urlopen", src)
+        with patch.dict(os.environ, {"ENABLE_SLACK_SUMMARY": "true",
                                      "SLACK_WEBHOOK_URL": "https://hooks.example/fake"},
                         clear=False):
-            with patch.object(ms.log, "info") as info:
-                ms.post_daily_slack_summary()
+            with patch("urllib.request.urlopen") as urlopen:
+                with patch.object(ms.log, "info") as info:
+                    ms.post_daily_slack_summary()
+        urlopen.assert_not_called()
         joined = " ".join(str(c) for c in info.call_args_list)
-        self.assertIn("OFF", joined)
+        self.assertIn("hard-disabled", joined)
 
     def test_scheduler_email_is_noop(self):
         import market_scheduler as ms
