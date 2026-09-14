@@ -304,5 +304,72 @@ class EnsureExitsBackstop(unittest.TestCase):
         self.assertEqual(len(client.submitted), 1)
 
 
+class SlackHardDisabled(unittest.TestCase):
+    """Slack outbound is a hard no-op — env/webhook cannot re-enable it."""
+
+    FAKE_HOOK = "https://hooks.slack.com/services/T00/B00/FAKE"
+
+    def test_helpers_never_http_post(self):
+        import slack_notify
+        self.assertFalse(slack_notify.ENABLE_SLACK_SUMMARY)
+        self.assertFalse(slack_notify.slack_outbound_enabled())
+        self.assertEqual(slack_notify.SLACK_WEBHOOK_URL, "")
+        with patch.dict(os.environ, {
+            "SLACK_WEBHOOK_URL": self.FAKE_HOOK,
+            "ENABLE_SLACK_SUMMARY": "true",
+        }):
+            with patch("urllib.request.urlopen") as urlopen:
+                with patch("urllib.request.Request") as req:
+                    ok = slack_notify.post_text(
+                        "CRITICAL: test", webhook_url=self.FAKE_HOOK)
+                    ok2 = slack_notify.post_webhook(
+                        self.FAKE_HOOK, {"text": "CRITICAL: test"})
+        self.assertFalse(ok)
+        self.assertFalse(ok2)
+        urlopen.assert_not_called()
+        req.assert_not_called()
+
+    def test_scheduler_summary_never_http_post(self):
+        import inspect
+        import market_scheduler as ms
+        self.assertFalse(ms.ENABLE_SLACK_SUMMARY)
+        self.assertEqual(ms.SLACK_WEBHOOK, "")
+        src = inspect.getsource(ms.post_daily_slack_summary)
+        self.assertNotIn("urlopen", src)
+        with patch.dict(os.environ, {
+            "SLACK_WEBHOOK_URL": self.FAKE_HOOK,
+            "ENABLE_SLACK_SUMMARY": "true",
+        }):
+            with patch("urllib.request.urlopen") as urlopen:
+                ms.post_daily_slack_summary()
+        urlopen.assert_not_called()
+
+    def test_health_critical_never_slacks(self):
+        import inspect
+        import health_check as hc
+        self.assertEqual(hc.SLACK_WEBHOOK, "")
+        src = inspect.getsource(hc.send_alert)
+        self.assertNotIn("urlopen", src)
+        with patch.dict(os.environ, {"SLACK_WEBHOOK_URL": self.FAKE_HOOK}):
+            with patch("urllib.request.urlopen") as urlopen:
+                with patch.object(hc, "GMAIL_ADDRESS", ""):
+                    with patch.object(hc, "GMAIL_APP_PW", ""):
+                        hc.send_alert(["CRITICAL: scheduler.log missing"])
+        urlopen.assert_not_called()
+
+    def test_health_critical_still_emails(self):
+        import health_check as hc
+        with patch.object(hc, "GMAIL_ADDRESS", "a@b.com"):
+            with patch.object(hc, "GMAIL_APP_PW", "pw"):
+                with patch.object(hc, "REPORT_TO_EMAIL", "a@b.com"):
+                    with patch("urllib.request.urlopen") as urlopen:
+                        with patch("health_check.smtplib.SMTP_SSL") as smtp:
+                            client = smtp.return_value.__enter__.return_value
+                            hc.send_alert(["CRITICAL: bot dead"])
+        urlopen.assert_not_called()
+        smtp.assert_called()
+        client.sendmail.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main()

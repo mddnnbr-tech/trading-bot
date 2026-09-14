@@ -49,10 +49,12 @@ MARKET_CLOSE    = (16, 0)    # hour, minute ET
 TICK_SECONDS    = 60         # how often the main loop fires
 EVAL_TIMES_ET   = [(10, 0), (15, 30)]   # twice-daily evaluation windows
 LEARN_TIME_ET   = (15, 45)              # weekly learning run: Fridays at 3:45 PM ET
-SUMMARY_TIME_ET = (15, 55)             # daily Slack summary: 3:55 PM ET
+SUMMARY_TIME_ET = (15, 55)             # EOD sync window (Slack summary is a no-op)
 
-SLACK_WEBHOOK   = os.getenv("SLACK_WEBHOOK_URL", "")
-SLACK_CHANNEL   = "#trading-alerts"
+# Slack is hard-disabled. Env cannot re-enable (leftover VM webhook ignored).
+ENABLE_SLACK_SUMMARY = False
+SLACK_WEBHOOK = ""
+SLACK_CHANNEL = "#trading-alerts"
 
 # ── Logging setup ────────────────────────────────────────────────────────────
 LOG_FILE = os.path.join(os.path.dirname(__file__), "logs", "scheduler.log")
@@ -135,100 +137,10 @@ def run_agent_tick():
 
 
 def post_daily_slack_summary():
-    """DISABLED by default — no daily Slack dump to #trading-alerts.
-
-    Set ENABLE_SLACK_SUMMARY=true only if you explicitly want the old
-    noisy EOD ping. Health-check CRITICAL alerts are a separate path.
-    """
-    flag = os.getenv("ENABLE_SLACK_SUMMARY", "false").strip().lower()
-    if flag not in ("1", "true", "yes", "on"):
-        log.info("Slack daily summary OFF (ENABLE_SLACK_SUMMARY!=true) — no trading noise")
-        return
-    if not SLACK_WEBHOOK:
-        log.debug("SLACK_WEBHOOK_URL not set — skipping daily summary")
-        return
-    try:
-        import json, urllib.request, urllib.error
-
-        today_str = datetime.now(ET).strftime("%Y-%m-%d")
-
-        # ── Pull real trade data from ledger ──────────────────────────────
-        realized = unrealized = 0.0
-        total_trades = wins = losses = open_count = 0
-        best_trade = worst_trade = None
-        try:
-            import trade_ledger as _ledger
-            all_t = _ledger.all_trades()
-            today_t = [t for t in all_t if t.opened_at_et.startswith(today_str)]
-            closed_t = [t for t in today_t if not t.is_open]
-            open_t   = [t for t in today_t if t.is_open]
-            realized   = sum(t.realized_pnl or 0 for t in closed_t)
-            unrealized = sum(t.unrealized_pnl or 0 for t in open_t)
-            total_trades = len(today_t)
-            wins   = sum(1 for t in closed_t if (t.realized_pnl or 0) > 0)
-            losses = sum(1 for t in closed_t if (t.realized_pnl or 0) <= 0)
-            open_count = len(open_t)
-
-            if closed_t:
-                best_trade  = max(closed_t, key=lambda t: t.realized_pnl or 0)
-                worst_trade = min(closed_t, key=lambda t: t.realized_pnl or 0)
-        except Exception:
-            pass
-
-        # ── Error count from log ──────────────────────────────────────────
-        errors_today = 0
-        log_path = os.path.join(os.path.dirname(__file__), "logs", "scheduler.log")
-        try:
-            with open(log_path) as f:
-                for line in f:
-                    if today_str in line and "[ERROR]" in line:
-                        errors_today += 1
-        except Exception:
-            pass
-
-        try:
-            from alpaca_stream import is_streaming
-            stream_status = "Alpaca stream ✅" if is_streaming() else "yfinance fallback"
-        except Exception:
-            stream_status = "unknown"
-
-        pnl_total = realized + unrealized
-        pnl_sign  = "+" if pnl_total >= 0 else ""
-        pnl_emoji = "📈" if pnl_total >= 0 else "📉"
-        status_icon = "✅" if errors_today < 10 else "⚠️"
-
-        lines = [
-            f"{status_icon} *BluSterling Daily Summary — PAPER — {datetime.now(ET).strftime('%a %b %d, %Y')}*",
-            f"",
-            f"_Paper trading only. These are not live fills._",
-            f"",
-            f"{pnl_emoji} *Total P&L: {pnl_sign}${pnl_total:,.2f}*  _(realized: {'+' if realized>=0 else ''}${realized:,.2f} | open: {'+' if unrealized>=0 else ''}${unrealized:,.2f})_",
-            f"• Trades today: *{total_trades}*  ({wins}W / {losses}L closed, {open_count} still open)",
-        ]
-
-        if best_trade and (best_trade.realized_pnl or 0) > 0:
-            lines.append(f"🏆 Best: *{best_trade.symbol}* {best_trade.side}  +${best_trade.realized_pnl:,.2f}")
-        if worst_trade and (worst_trade.realized_pnl or 0) < 0:
-            lines.append(f"📉 Worst: *{worst_trade.symbol}* {worst_trade.side}  ${worst_trade.realized_pnl:,.2f}")
-
-        lines += [
-            f"",
-            f"• Data: {stream_status}  |  Errors: {errors_today}",
-            f"_Next run: Mon–Fri 9:30 AM ET_",
-        ]
-
-        text = "\n".join(lines)
-
-        payload = json.dumps({"text": text}).encode()
-        req = urllib.request.Request(
-            SLACK_WEBHOOK,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        urllib.request.urlopen(req, timeout=10)
-        log.info("Daily Slack summary posted.")
-    except Exception as e:
-        log.warning(f"Slack summary failed: {e}")
+    """Hard-disabled. Never posts to Slack (webhook / ENABLE_SLACK_SUMMARY ignored)."""
+    from slack_notify import post_text
+    post_text("(suppressed daily summary)")
+    log.info("Slack daily summary hard-disabled — no outbound")
 
 
 def send_daily_email():
@@ -454,9 +366,9 @@ def main():
                 _eval_done_this_window.add(learn_key)
                 run_learning_cycle()
 
-            # ── Daily Slack summary at 3:55 PM ET ────────────────────────
-            # Email is deliberately NOT sent here — daily_reporter.py's cron
-            # job at 4:35 PM sends the one comprehensive daily email.
+            # ── EOD window at 3:55 PM ET ─────────────────────────────────
+            # Slack summary is a hard no-op. Email is daily_reporter.py cron
+            # (--send-now). This window still syncs Alpaca positions.
             summary_key = f"summary_{now.date()}"
             if (now.hour == SUMMARY_TIME_ET[0]
                     and now.minute == SUMMARY_TIME_ET[1]

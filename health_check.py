@@ -5,9 +5,8 @@ Autonomous watchdog. Runs hourly via cron during market hours.
 
 Purpose: catch the class of bug that cost weeks last time (dead cron,
 duplicate .env keys, stale ledger, broken email auth) BEFORE it silently
-runs for days. Self-heals what's safe to auto-fix. Sends exactly one
-Slack/email alert only when something is actually broken — no noise on
-healthy days, so this never becomes something you have to babysit.
+runs for days. Self-heals what's safe to auto-fix. CRITICAL findings
+email/log only — Slack outbound is hard-disabled (webhook ignored).
 
 Checks:
   1. Duplicate keys in .env (auto-fixes: keeps last occurrence, the one
@@ -42,7 +41,8 @@ ET = ZoneInfo("America/New_York")
 GMAIL_ADDRESS   = os.getenv("GMAIL_ADDRESS", "")
 GMAIL_APP_PW    = os.getenv("GMAIL_APP_PASSWORD", "")
 REPORT_TO_EMAIL = os.getenv("REPORT_TO_EMAIL", GMAIL_ADDRESS)
-SLACK_WEBHOOK   = os.getenv("SLACK_WEBHOOK_URL", "")
+# Slack is hard-disabled. Leftover SLACK_WEBHOOK_URL in .env is ignored.
+SLACK_WEBHOOK = ""
 
 
 def check_and_fix_env_duplicates() -> list[str]:
@@ -226,17 +226,9 @@ def send_alert(issues: list[str]) -> None:
     subject = f"⚠️ Trading Bot Health Check FAILED — {datetime.now(ET).strftime('%b %d, %I:%M %p ET')}"
     body = "The following issues were found:\n\n" + "\n\n".join(f"• {i}" for i in issues)
 
-    if SLACK_WEBHOOK:
-        try:
-            import json, urllib.request
-            text = f"🚨 *Health Check Alert*\n" + "\n".join(f"• {i}" for i in issues)
-            req = urllib.request.Request(
-                SLACK_WEBHOOK, data=json.dumps({"text": text}).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            urllib.request.urlopen(req, timeout=10)
-        except Exception:
-            pass
+    # Slack is hard-disabled (CRITICAL included). Email / log only.
+    from slack_notify import post_text
+    post_text("(suppressed health alert)")
 
     if GMAIL_ADDRESS and GMAIL_APP_PW:
         try:
@@ -248,12 +240,13 @@ def send_alert(issues: list[str]) -> None:
                 s.login(GMAIL_ADDRESS, GMAIL_APP_PW)
                 s.sendmail(GMAIL_ADDRESS, REPORT_TO_EMAIL, msg.as_string())
         except Exception:
-            pass  # if email itself is broken, Slack alert above is the fallback
+            pass  # email failure is logged by the caller; do not Slack
 
 
 def _should_alert(issues: list[str]) -> bool:
-    """Alert policy: email/Slack ONLY for CRITICAL findings, and never
+    """Alert policy: email/log ONLY for CRITICAL findings, and never
     re-alert the same set of problems more than once per 6 hours.
+    Slack is never used.
 
     Why: the hourly cron re-emailed the same known WARNING every hour
     (4 duplicate emails on 2026-07-17 for a drift issue that already had
