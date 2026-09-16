@@ -190,6 +190,17 @@ def expand_agent_names(raw: str) -> list[str]:
     return [raw]
 
 
+def is_wrapper_agent_name(name: str) -> bool:
+    """True for MetaAgent, BrokerSync, or MetaAgent(...) compound labels.
+
+    Display/scorecard helper only — does not change stored trades or live weights.
+    """
+    n = (name or "").strip()
+    if not n or n in {"MetaAgent", "BrokerSync"}:
+        return True
+    return n.startswith("MetaAgent(")
+
+
 def _parse_agent_field(agent_raw: str) -> tuple[str, str]:
     """Split MetaAgent(SubA, SubB) → ('MetaAgent', 'SubA, SubB').
     Plain 'TechnicalAgent' → ('TechnicalAgent', '')."""
