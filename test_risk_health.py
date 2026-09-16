@@ -7,6 +7,7 @@ the reporter log-format contract so a v11 regex cannot silently report
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -154,6 +155,8 @@ class ReporterLogParse(unittest.TestCase):
                 "warnings": [],
             },
             "agent_roster": [
+                {"name": "MetaAgent(NewsAgent, OptionsFlowAgent)",
+                 "status": "active", "weight": 1.00, "pnl": 999},
                 {"name": "NewsAgent", "status": "active", "weight": 1.00, "pnl": 210},
                 {"name": "MomentumAgent", "status": "benched", "weight": 0.15, "pnl": -80},
                 {"name": "EarningsAgent", "status": "active", "weight": 0.40, "pnl": 12},
@@ -185,7 +188,120 @@ class ReporterLogParse(unittest.TestCase):
         self.assertNotIn("Top 3 agents", html)
         self.assertNotIn("Daily Report v2", html)
         self.assertNotIn("v11", html.lower())
+        self.assertIn("Agents (active / benched / weight", html)
+        self.assertIn("NewsAgent", html)
+        self.assertNotIn(">MetaAgent(", html)
+        self.assertNotIn("MetaAgent(NewsAgent, OptionsFlowAgent)", html)
 
+class ScorecardLeafRoster(unittest.TestCase):
+    def test_expand_unwraps_meta_wrapper(self):
+        from trade_ledger import expand_agent_names, is_wrapper_agent_name
+        self.assertEqual(
+            expand_agent_names("MetaAgent(NewsAgent, OptionsFlowAgent)"),
+            ["NewsAgent", "OptionsFlowAgent"],
+        )
+        self.assertEqual(expand_agent_names("NewsAgent"), ["NewsAgent"])
+        self.assertEqual(expand_agent_names("MetaAgent"), [])
+        self.assertEqual(expand_agent_names("BrokerSync"), [])
+        self.assertTrue(is_wrapper_agent_name("MetaAgent(NewsAgent)"))
+        self.assertTrue(is_wrapper_agent_name("MetaAgent"))
+        self.assertFalse(is_wrapper_agent_name("NewsAgent"))
+
+    def test_injected_roster_drops_wrappers(self):
+        import daily_reporter as dr
+        roster = dr.scorecard_agent_roster({
+            "agent_roster": [
+                {"name": "MetaAgent(NewsAgent, OptionsFlowAgent)",
+                 "status": "active", "weight": 1.0, "pnl": 10},
+                {"name": "NewsAgent", "status": "active", "weight": 0.42, "pnl": -100},
+                {"name": "MetaAgent", "status": "active", "weight": 1.0, "pnl": 999},
+            ]
+        })
+        names = [r["name"] for r in roster]
+        self.assertEqual(names, ["NewsAgent"])
+        self.assertAlmostEqual(roster[0]["weight"], 0.42)
+
+    def test_summary_wrappers_do_not_get_fake_weight_1(self):
+        import daily_reporter as dr
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "agent_summary.json").write_text(json.dumps({
+            "MetaAgent(NewsAgent, OptionsFlowAgent)": {
+                "active": True, "total_pnl": 50,
+            },
+            "NewsAgent": {"active": True, "total_pnl": -200},
+        }))
+        orig = dr.LOGS_DIR
+        dr.LOGS_DIR = tmp
+        try:
+            with patch.object(dr, "_load_meta_weights",
+                              return_value={"NewsAgent": 0.31}):
+                roster = dr.scorecard_agent_roster({})
+        finally:
+            dr.LOGS_DIR = orig
+        names = [r["name"] for r in roster]
+        self.assertNotIn("MetaAgent(NewsAgent, OptionsFlowAgent)", names)
+        self.assertNotIn("MetaAgent", names)
+        self.assertTrue(all(not n.startswith("MetaAgent") for n in names))
+        news = next(r for r in roster if r["name"] == "NewsAgent")
+        self.assertAlmostEqual(news["weight"], 0.31)
+
+    def test_email_weight_table_lists_leaves_not_wrappers(self):
+        import daily_reporter as dr
+        reporter = dr.DailyReporter.__new__(dr.DailyReporter)
+        data = {
+            "date_display": "Thursday, September 10, 2026",
+            "generated_at": "2026-09-10 16:35 ET",
+            "trading_mode": "paper",
+            "total_pnl": 0,
+            "approved_count": 2,
+            "rejected_count": 4,
+            "raw_signals_total": 12,
+            "passed_synthesis": 3,
+            "total_notional": 0,
+            "findings": [],
+            "ledger_status": {"available": True, "added": 0, "total": 0, "refresh": {}},
+            "sched": {
+                "tick_count": 100, "error_count": 5,
+                "system_error_count": 1, "fetch_error_count": 4,
+                "last_log": "16:00:00", "fetch_404_symbols": {},
+            },
+            "approved_trades": [],
+            "rejection_reasons": {},
+            "agent_activity": {
+                "MetaAgent(MomentumAgent, BreakoutAgent)": {
+                    "approved": 2, "rejected": 0, "total": 2,
+                },
+                "MomentumAgent": {"approved": 1, "rejected": 0, "total": 1},
+            },
+            "snapshot": {
+                "today": "2026-09-10",
+                "equity": 98765,
+                "prev_close": 100000,
+                "day_pnl": -1235,
+                "naked": [],
+                "ghosts": [],
+                "windows": [],
+                "warnings": [],
+            },
+            "agent_roster": [
+                {"name": "MetaAgent(MomentumAgent)", "status": "active",
+                 "weight": 1.0, "pnl": 1},
+                {"name": "MomentumAgent", "status": "active",
+                 "weight": 0.55, "pnl": 12},
+            ],
+            "shadow_pnl": dr._empty_pnl_summary(),
+            "live_pnl": dr._empty_pnl_summary(),
+        }
+        html = reporter.format_email_html(data)
+        self.assertIn("MomentumAgent", html)
+        self.assertIn("0.55", html)
+        self.assertIn("Agents (active / benched / weight", html)
+        self.assertNotIn(">MetaAgent(", html)
+        self.assertNotIn("MetaAgent(MomentumAgent)", html)
+        self.assertNotIn("MetaAgent(MomentumAgent, BreakoutAgent)", html)
+
+
+class ReporterScorecardFlags(unittest.TestCase):
     def test_scorecard_renders_evaluator_flags_without_rotation_log(self):
         import daily_reporter as dr
         actions = dr.scorecard_rotation_actions("2026-09-11", {
