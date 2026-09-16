@@ -119,6 +119,129 @@ def _to_et_time_str(ts_str: str) -> str:
         return ""
 
 
+# ── Scorecard display helpers (no trading / rotator side effects) ─────────────
+
+def _leaf_agent_names(raw: str) -> list[str]:
+    """Unwrap MetaAgent(...) into leaf names. Empty for bare MetaAgent."""
+    if _LEDGER_AVAILABLE:
+        return list(_ledger.expand_agent_names(raw))
+    raw = (raw or "").strip()
+    if not raw or raw in {"MetaAgent", "BrokerSync"}:
+        return []
+    m = re.match(r"^([A-Za-z_]+)\s*\(([^)]*)\)\s*$", raw)
+    if m and m.group(1).strip() == "MetaAgent":
+        return [p.strip() for p in m.group(2).split(",")
+                if p.strip() and p.strip() not in {"MetaAgent", "BrokerSync"}]
+    if raw.startswith("MetaAgent("):
+        return []
+    return [raw]
+
+
+def _is_wrapper_agent_name(name: str) -> bool:
+    if _LEDGER_AVAILABLE:
+        return bool(_ledger.is_wrapper_agent_name(name))
+    n = (name or "").strip()
+    return (not n) or n in {"MetaAgent", "BrokerSync"} or n.startswith("MetaAgent(")
+
+
+def _read_json(path: Path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text()) or default
+    except Exception:
+        pass
+    return default
+
+
+def _load_meta_weights() -> dict:
+    """Read-only copy of MetaAgent weights for the scorecard. Never writes."""
+    try:
+        from meta_agent import MetaAgent
+        return dict(MetaAgent._load_performance_weights() or {})
+    except Exception:
+        try:
+            from meta_agent import DEFAULT_WEIGHTS
+            return dict(DEFAULT_WEIGHTS)
+        except Exception:
+            return {}
+
+
+def scorecard_agent_roster(d: dict | None = None) -> list[dict]:
+    """Leaf-agent roster: status, MetaAgent weight, P&L.
+
+    MetaAgent(*) wrapper labels are stripped. Soft leaf weights are the real
+    MetaAgent values. Unknown wrapper names are never invented at 1.00 —
+    that was polluting kill/BENCH reads on the Learning Loop scorecard.
+    """
+    d = d or {}
+    if "agent_roster" in d:
+        return [
+            row for row in (d.get("agent_roster") or [])
+            if isinstance(row, dict)
+            and not _is_wrapper_agent_name(str(row.get("name") or ""))
+        ]
+    try:
+        from meta_agent import DEFAULT_WEIGHTS
+        names = list(DEFAULT_WEIGHTS)
+        defaults = dict(DEFAULT_WEIGHTS)
+    except Exception:
+        names = []
+        defaults = {}
+
+    def _add_name(raw) -> None:
+        for leaf in _leaf_agent_names(str(raw or "")):
+            if leaf not in names:
+                names.append(leaf)
+
+    summary = _read_json(LOGS_DIR / "agent_summary.json", {})
+    eval_data = _read_json(LOGS_DIR / "latest_eval.json", {})
+    eval_agents = {
+        a.get("name"): a
+        for a in (eval_data.get("agents") or [])
+        if isinstance(a, dict) and a.get("name")
+    }
+    if isinstance(summary, dict):
+        for name in summary:
+            _add_name(name)
+    for name in eval_agents:
+        _add_name(name)
+
+    weights = _load_meta_weights()
+    roster = []
+    seen: set[str] = set()
+    for name in names:
+        if _is_wrapper_agent_name(name) or name in seen:
+            continue
+        seen.add(name)
+        info = summary.get(name) if isinstance(summary, dict) else {}
+        if not isinstance(info, dict):
+            info = {}
+        ev = eval_agents.get(name) or {}
+        if "active" in info:
+            status = "active" if info.get("active", True) else "benched"
+        elif "active" in ev:
+            status = "active" if ev.get("active", True) else "benched"
+        else:
+            status = "active"
+        pnl = info.get("total_pnl")
+        if pnl is None:
+            pnl = ev.get("pnl_20d") if ev.get("pnl_20d") is not None else ev.get("pnl_alltime")
+        w = weights.get(name)
+        if w is None:
+            w = defaults.get(name)
+        if w is None:
+            # Do not invent 1.00 for leftover compound labels.
+            continue
+        roster.append({
+            "name": name,
+            "status": status,
+            "weight": float(w),
+            "pnl": float(pnl or 0),
+        })
+    roster.sort(key=lambda r: r["pnl"], reverse=True)
+    return roster
+
+
 # ── Data readers ─────────────────────────────────────────────────────────────
 
 def read_scheduler_today() -> dict:
@@ -593,17 +716,20 @@ class DailyReporter:
             reason = r.get("reason", "unspecified")
             rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
 
-        # --- Per-agent activity ---
+        # --- Per-agent activity (leaf agents only — unwrap MetaAgent(...)) ---
         agent_activity: dict[str, dict] = {}
         for s in signals_today:
-            agent = s.get("agent", "Unknown")
-            if agent not in agent_activity:
-                agent_activity[agent] = {"approved": 0, "rejected": 0, "total": 0}
-            agent_activity[agent]["total"] += 1
-            if s.get("event") in APPROVED_EVENTS:
-                agent_activity[agent]["approved"] += 1
-            elif s.get("event") in REJECTED_EVENTS:
-                agent_activity[agent]["rejected"] += 1
+            leaves = _leaf_agent_names(s.get("agent", "Unknown"))
+            if not leaves:
+                continue
+            for agent in leaves:
+                if agent not in agent_activity:
+                    agent_activity[agent] = {"approved": 0, "rejected": 0, "total": 0}
+                agent_activity[agent]["total"] += 1
+                if s.get("event") in APPROVED_EVENTS:
+                    agent_activity[agent]["approved"] += 1
+                elif s.get("event") in REJECTED_EVENTS:
+                    agent_activity[agent]["rejected"] += 1
 
         # --- Closed trades / P&L (still from PerformanceLogger) ---
         try:
@@ -1109,9 +1235,45 @@ class DailyReporter:
 
         return kpi_row + meta_html
 
+    def _format_agent_weight_section(self, d: dict) -> str:
+        """Leaf-agent weight table used for Learning Loop kill/BENCH reads."""
+        roster = scorecard_agent_roster(d)
+        if not roster:
+            return (
+                '<p style="color:#94a3b8;font-style:italic">'
+                'No leaf-agent weights yet.</p>'
+            )
+
+        def clr(v):
+            return "#22c55e" if (v or 0) >= 0 else "#ef4444"
+
+        trows = "".join(
+            f'<tr><td style="padding:4px 8px;font-weight:600">{a["name"]}</td>'
+            f'<td style="padding:4px 8px">{a.get("status") or "active"}</td>'
+            f'<td style="padding:4px 8px;text-align:right">{float(a.get("weight") or 0):.2f}</td>'
+            f'<td style="padding:4px 8px;text-align:right;color:{clr(a.get("pnl"))}">'
+            f'${float(a.get("pnl") or 0):+,.0f}</td></tr>'
+            for a in roster
+        )
+        return (
+            '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+            '<thead><tr style="background:#1e293b;color:#fff">'
+            '<th style="padding:6px 8px;text-align:left">Agent</th>'
+            '<th style="padding:6px 8px;text-align:left">Status</th>'
+            '<th style="padding:6px 8px;text-align:right">Weight</th>'
+            '<th style="padding:6px 8px;text-align:right">P&amp;L</th>'
+            '</tr></thead><tbody>' + trows + '</tbody></table>'
+            + '<p style="font-size:10px;color:#94a3b8;margin:6px 0 0;font-style:italic">'
+              'Leaf agents only. MetaAgent(...) wrapper rows are omitted so '
+              'soft weights (not a fake 1.00) drive kill/BENCH reads.</p>'
+        )
+
     def _format_agent_evaluator_section(self, d: dict) -> str:
-        """Per-agent attribution table: every agent that contributed to any trade."""
-        agents = d.get("agent_attribution") or []
+        """Per-agent attribution table: every leaf agent that contributed."""
+        agents = [
+            a for a in (d.get("agent_attribution") or [])
+            if not _is_wrapper_agent_name(str(a.get("agent") or ""))
+        ]
         if not agents:
             return '<p style="color:#94a3b8;font-style:italic">No agent attribution data yet.</p>'
 
@@ -1209,6 +1371,7 @@ class DailyReporter:
         daily_trends_html  = self._format_daily_trends_section(d)
         portfolio_html     = self._format_portfolio_section(d)
         agent_eval_html    = self._format_agent_evaluator_section(d)
+        agent_weight_html  = self._format_agent_weight_section(d)
         open_positions_html = self._format_open_positions_section(d)
 
         # Ledger status banner — surfaces parsing/refresh problems immediately
@@ -1285,6 +1448,8 @@ class DailyReporter:
         if d["agent_activity"]:
             arows = ""
             for agent, stats in sorted(d["agent_activity"].items(), key=lambda x: -x[1]["total"])[:25]:
+                if _is_wrapper_agent_name(agent):
+                    continue
                 arows += (f'<tr><td style="padding:6px 10px;font-size:12px;font-weight:600">{agent[:60]}</td>'
                           f'<td style="padding:6px 10px;text-align:right;color:#22c55e">{stats["approved"]}</td>'
                           f'<td style="padding:6px 10px;text-align:right;color:#ef4444">{stats["rejected"]}</td>'
@@ -1359,6 +1524,9 @@ class DailyReporter:
   <div class="body">
     {findings_html}
     {self._format_intelligence_section(d)}
+
+    <div class="section-title">Agents (active / benched / weight / P&amp;L)</div>
+    {agent_weight_html}
 
     <div class="section-title">⏱  System Health</div>
     <p style="font-size:13px;color:#475569;margin:0">

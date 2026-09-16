@@ -151,6 +151,42 @@ def _normalize_side(raw_side: str) -> str:
     return s  # leave unknowns alone for visibility
 
 
+def expand_agent_names(raw: str) -> list[str]:
+    """Split ``MetaAgent(SubA, SubB)`` into real leaf agent names.
+
+    Display/attribution helper only — does not change how trades are stored
+    or how MetaAgent computes live weights. Bare ``MetaAgent`` / ``BrokerSync``
+    yield []. Nested wrapper labels are never returned.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    m = re.match(r"^([A-Za-z_]+)\s*\(([^)]*)\)\s*$", raw)
+    if m:
+        wrapper, inner = m.group(1).strip(), m.group(2).strip()
+        parts = [p.strip() for p in inner.split(",") if p.strip()]
+        if wrapper == "MetaAgent":
+            return [p for p in parts if p not in {"MetaAgent", "BrokerSync"}]
+        out: list[str] = []
+        if wrapper not in {"MetaAgent", "BrokerSync"}:
+            out.append(wrapper)
+        for p in parts:
+            if p not in {"MetaAgent", "BrokerSync"} and p not in out:
+                out.append(p)
+        return out
+    if raw in {"MetaAgent", "BrokerSync"}:
+        return []
+    return [raw]
+
+
+def is_wrapper_agent_name(name: str) -> bool:
+    """True for MetaAgent, BrokerSync, or MetaAgent(...) compound labels."""
+    n = (name or "").strip()
+    if not n or n in {"MetaAgent", "BrokerSync"}:
+        return True
+    return n.startswith("MetaAgent(")
+
+
 def _parse_agent_field(agent_raw: str) -> tuple[str, str]:
     """Split MetaAgent(SubA, SubB) → ('MetaAgent', 'SubA, SubB').
     Plain 'TechnicalAgent' → ('TechnicalAgent', '')."""
